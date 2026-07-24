@@ -7,6 +7,7 @@ import {
   EvidenceBuilder,
   LocalSessionSigner,
 } from "../src/index.js";
+import * as fs from "fs";
 
 describe("@veridex/goat-agentkit", () => {
   const policyRules = {
@@ -28,6 +29,11 @@ describe("@veridex/goat-agentkit", () => {
   };
 
   beforeEach(() => {
+    try {
+      if (fs.existsSync("veridex-policy-state.json")) {
+        fs.unlinkSync("veridex-policy-state.json");
+      }
+    } catch {}
     vi.clearAllMocks();
   });
 
@@ -54,6 +60,7 @@ describe("@veridex/goat-agentkit", () => {
     await wrappedWallet.sendTransaction({
       to: "0x1111111111111111111111111111111111111111",
       value: 2.5,
+      amountUSD: 2.5,
       asset: "USDC",
     });
 
@@ -71,8 +78,10 @@ describe("@veridex/goat-agentkit", () => {
     await wrappedWallet.sendTransaction({
       to: "0x1111111111111111111111111111111111111111",
       value: 2.5,
+      amountUSD: 2.5,
       asset: "USDC",
     });
+
 
     // Evidence Bundle now signed by Session Key #2!
     expect(EvidenceBuilder.verifyBundle(emittedBundle).recoveredAddress).toBe(session2.sessionAddress);

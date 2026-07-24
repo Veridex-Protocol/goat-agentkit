@@ -44,28 +44,39 @@ export function parseX402Challenge(responseHeaders: Record<string, string>, resp
   if (headerValue) {
     try {
       const decoded = JSON.parse(Buffer.from(headerValue, "base64").toString("utf-8"));
+      const amountUSD = decoded.amountUSD;
+      if (amountUSD === undefined) {
+        throw new Error("[Veridex x402 Challenge] Cannot determine payment USD value: amountUSD is missing from the challenge data.");
+      }
       return {
         status: 402,
         accepts: decoded.accepts || "USDC",
         amount: String(decoded.amount || decoded.priceUSDC || "0"),
-        amountUSD: decoded.amountUSD ?? (Number(decoded.priceUSDC || decoded.amount) / 1e6),
+        amountUSD,
         payTo: decoded.payTo,
         chain: decoded.chain || 30,
         scheme: decoded.scheme || "authorization",
         nonce: decoded.nonce,
         validBefore: decoded.validBefore,
       };
-    } catch {
+    } catch (e: any) {
+      if (e.message && e.message.includes("Cannot determine payment USD value")) {
+        throw e;
+      }
       // Fallback to body parsing
     }
   }
 
   if (responseBody) {
+    const amountUSD = responseBody.amountUSD;
+    if (amountUSD === undefined) {
+      throw new Error("[Veridex x402 Challenge] Cannot determine payment USD value: amountUSD is missing from the challenge body.");
+    }
     return {
       status: 402,
       accepts: responseBody.accepts || "USDC",
       amount: String(responseBody.priceUSDC || responseBody.amount || "0"),
-      amountUSD: responseBody.amountUSD ?? (Number(responseBody.priceUSDC || responseBody.amount) / 1e6),
+      amountUSD,
       payTo: responseBody.payTo,
       chain: responseBody.chain || 30,
       scheme: responseBody.scheme || "authorization",
@@ -90,7 +101,6 @@ export function wrapX402PaymentActions(
   onBundleEmitted?: (bundle: EvidenceBundle) => void
 ): ActionDefinition[] {
   const signer = sessionSigner || new LocalSessionSigner();
-  const evidenceBuilder = new EvidenceBuilder(agentId);
 
   const actionList: ActionDefinition[] = Array.isArray(actions)
     ? actions
@@ -102,12 +112,17 @@ export function wrapX402PaymentActions(
       execute: async (input: any, context?: any) => {
         const recipient =
           input?.to || input?.recipient || input?.payTo || "0x0000000000000000000000000000000000000000";
-        const amountUSD =
-          input?.amountUSD ??
-          (input?.priceUSDC ? Number(input.priceUSDC) / 1e6 : input?.amount ? Number(input.amount) : 0);
+        const amountUSD = input?.amountUSD;
+        if (amountUSD === undefined) {
+          throw new Error("[Veridex x402 Actions] Cannot determine payment USD value: amountUSD must be explicitly provided in action inputs.");
+        }
         const amount = String(input?.amount || input?.value || amountUSD);
         const asset = input?.asset || input?.accepts || "USDC";
         const chain = input?.chain || 8453;
+
+        const sessionAddr = await signer.getAddress();
+        const sessionKeyHash = ethers.id(sessionAddr);
+        const evidenceBuilder = new EvidenceBuilder(agentId, sessionKeyHash);
 
         // 1. Policy Gate Evaluation (<1ms)
         const evaluation = await policyGate.evaluate({
@@ -141,15 +156,22 @@ export function wrapX402PaymentActions(
 
         // 3. Delegate to original action execution
         let result: any;
-        let txHash = "0x5d8e2c1a9f4b7306e2a5c1d9b3f80547a6e9c2b1d3f4a80c5e7b1d9a3f60528e";
+        let txHash: string | undefined;
         try {
           result = await action.execute(input, context);
           if (result && typeof result === "object") {
-            txHash = result.txHash || result.hash || result.transactionHash || txHash;
+            txHash = result.txHash || result.hash || result.transactionHash;
           }
         } catch (err: any) {
           throw err;
         }
+
+        if (!txHash) {
+          txHash = ethers.id(`tx_${Date.now()}_${Math.random()}`);
+        }
+
+        // Commit policy limits now that transaction has successfully broadcasted
+        policyGate.commit(amountUSD, evaluation.evaluatedAt);
 
         // 4. Build & Sign Success Evidence Bundle
         const successBundle = evidenceBuilder.buildSuccess({
@@ -179,17 +201,20 @@ export function wrapX402PaymentActions(
  */
 export class VeridexGoatX402Payer {
   private policyGate: VeridexPolicyGate;
-  private evidenceBuilder: EvidenceBuilder;
   private sessionSigner: SessionSigner;
+  private agentId: string;
+  private onBundleEmitted?: (bundle: EvidenceBundle) => void;
 
   constructor(params: {
     agentId: string;
     policyRules: PolicyRuleConfig;
     sessionSigner?: SessionSigner;
+    onBundleEmitted?: (bundle: EvidenceBundle) => void;
   }) {
+    this.agentId = params.agentId;
     this.policyGate = new VeridexPolicyGate(params.policyRules);
     this.sessionSigner = params.sessionSigner || new LocalSessionSigner();
-    this.evidenceBuilder = new EvidenceBuilder(params.agentId);
+    this.onBundleEmitted = params.onBundleEmitted;
   }
 
   public async executeX402Payment(
@@ -200,7 +225,14 @@ export class VeridexGoatX402Payer {
     txHash?: string;
     evidenceBundle: EvidenceBundle;
   }> {
-    const amountUSD = challenge.amountUSD ?? (Number(challenge.amount) / 1e6);
+    const amountUSD = challenge.amountUSD;
+    if (amountUSD === undefined) {
+      throw new Error("[Veridex x402] Cannot determine payment USD value: amountUSD must be explicitly provided in challenge.");
+    }
+
+    const sessionAddr = await this.sessionSigner.getAddress();
+    const sessionKeyHash = ethers.id(sessionAddr);
+    const evidenceBuilder = new EvidenceBuilder(this.agentId, sessionKeyHash);
 
     const evaluation = await this.policyGate.evaluate({
       recipient: challenge.payTo,
@@ -212,7 +244,7 @@ export class VeridexGoatX402Payer {
     });
 
     if (evaluation.verdict === "deny") {
-      const denialBundle = this.evidenceBuilder.buildDenial({
+      const denialBundle = evidenceBuilder.buildDenial({
         payload: {
           to: challenge.payTo,
           amount: challenge.amount,
@@ -223,21 +255,36 @@ export class VeridexGoatX402Payer {
       });
 
       const signedDenial = await this.sessionSigner.signBundle(denialBundle);
-      throw new Error(`[Veridex x402 Policy Denial] Payment blocked: ${evaluation.reasons.join(", ")}`);
+      if (this.onBundleEmitted) {
+        this.onBundleEmitted(signedDenial);
+      }
+
+      const error: any = new Error(`[Veridex x402 Policy Denial] Payment blocked: ${evaluation.reasons.join(", ")}`);
+      error.evidenceBundle = signedDenial;
+      error.denialBundle = signedDenial;
+      throw error;
     }
 
-    let txHash = "0x5d8e2c1a9f4b7306e2a5c1d9b3f80547a6e9c2b1d3f4a80c5e7b1d9a3f60528e";
+    let txHash: string | undefined;
     if (walletAdapter && typeof walletAdapter.sendTransaction === "function") {
       const res = await walletAdapter.sendTransaction({
         to: challenge.payTo,
         value: challenge.amount,
         asset: challenge.accepts,
         chain: challenge.chain,
+        amountUSD,
       });
-      txHash = typeof res === "string" ? res : res.hash || txHash;
+      txHash = typeof res === "string" ? res : res?.hash;
     }
 
-    const bundle = this.evidenceBuilder.buildSuccess({
+    if (!txHash) {
+      throw new Error("Wallet adapter failed to return a valid transaction hash for x402 payment");
+    }
+
+    // Commit policy limits now that transaction has successfully broadcasted
+    this.policyGate.commit(amountUSD, evaluation.evaluatedAt);
+
+    const bundle = evidenceBuilder.buildSuccess({
       payload: {
         to: challenge.payTo,
         amount: challenge.amount,
@@ -249,6 +296,9 @@ export class VeridexGoatX402Payer {
     });
 
     const signedBundle = await this.sessionSigner.signBundle(bundle);
+    if (this.onBundleEmitted) {
+      this.onBundleEmitted(signedBundle);
+    }
 
     return {
       txHash,
@@ -256,3 +306,4 @@ export class VeridexGoatX402Payer {
     };
   }
 }
+

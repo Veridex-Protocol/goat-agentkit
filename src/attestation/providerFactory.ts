@@ -19,7 +19,7 @@ export function getAttestationProvider(options: AttestationFactoryOptions | TEEP
       return new AzureMaaAttestationProvider(typeof options === "object" ? options.endpoint : undefined);
 
     case "aws-nitro-enclave":
-      return new AwsNitroKmsAttestationProvider(typeof options === "object" ? options.measurement : undefined);
+      return new AwsNitroKmsAttestationProvider(typeof options === "object" ? options.endpoint : undefined);
 
     case "phala-dstack":
       return new PhalaDstackAttestationProvider(typeof options === "object" ? options.endpoint : undefined);

@@ -72,9 +72,12 @@ export class EvidenceBuilder {
   private agentId: string;
   private sessionKeyHash: string;
 
-  constructor(agentId: string, sessionKeyHash?: string) {
+  constructor(agentId: string, sessionKeyHash: string) {
+    if (!sessionKeyHash || typeof sessionKeyHash !== "string" || sessionKeyHash.trim().length === 0) {
+      throw new Error("[EvidenceBuilder] sessionKeyHash parameter is required and cannot be empty.");
+    }
     this.agentId = agentId;
-    this.sessionKeyHash = sessionKeyHash || "0x80ebf6ceb5308b4baa9295dd3322c0f011a00ef26a6cc364db84aa8fd66de977";
+    this.sessionKeyHash = sessionKeyHash;
   }
 
   public buildDenial(params: {
@@ -107,15 +110,18 @@ export class EvidenceBuilder {
     const canonicalTrace = canonicalizeJson(trace);
     const traceHash = keccak256(toUtf8Bytes(canonicalTrace));
 
-    const bundle: EvidenceBundle = {
+    const finalBundle: EvidenceBundle = {
       trace,
       traceHash,
       verdict: params.evaluation,
       assembledAt: timestamp,
     };
 
-    bundle.bundleHash = keccak256(toUtf8Bytes(canonicalizeJson(bundle)));
-    return bundle;
+    const copy = { ...finalBundle };
+    const bundleHash = keccak256(toUtf8Bytes(canonicalizeJson(copy)));
+    finalBundle.bundleHash = bundleHash;
+
+    return finalBundle;
   }
 
   public buildSuccess(params: {
@@ -151,7 +157,7 @@ export class EvidenceBuilder {
     const canonicalTrace = canonicalizeJson(trace);
     const traceHash = keccak256(toUtf8Bytes(canonicalTrace));
 
-    const bundle: EvidenceBundle = {
+    const finalBundle: EvidenceBundle = {
       trace,
       traceHash,
       verdict: params.evaluation,
@@ -170,9 +176,13 @@ export class EvidenceBuilder {
       assembledAt: timestamp,
     };
 
-    bundle.bundleHash = keccak256(toUtf8Bytes(canonicalizeJson(bundle)));
-    return bundle;
+    const copy = { ...finalBundle };
+    const bundleHash = keccak256(toUtf8Bytes(canonicalizeJson(copy)));
+    finalBundle.bundleHash = bundleHash;
+
+    return finalBundle;
   }
+
 
   /**
    * Standalone zero-dependency verification helper using keccak256 + ecrecover only.

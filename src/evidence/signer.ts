@@ -14,9 +14,8 @@ export class LocalSessionSigner implements SessionSigner {
       try {
         const formattedKey = privateKey.trim().startsWith("0x") ? privateKey.trim() : `0x${privateKey.trim()}`;
         this.wallet = new Wallet(formattedKey);
-      } catch (err) {
-        console.warn("[LocalSessionSigner] Invalid private key provided, creating ephemeral session key fallback.");
-        this.wallet = Wallet.createRandom();
+      } catch (err: any) {
+        throw new Error(`[LocalSessionSigner] Invalid private key provided: ${err.message}`);
       }
     } else {
       this.wallet = Wallet.createRandom();

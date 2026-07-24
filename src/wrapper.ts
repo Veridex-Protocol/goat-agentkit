@@ -54,13 +54,20 @@ export function rotateSessionKey(wrappedAdapter: any, newSession: ActiveSession)
   }
 }
 
+import { ethers } from "ethers";
+
+const ERC20_INTERFACE = new ethers.Interface([
+  "function transfer(address to, uint256 value)",
+  "function transferFrom(address from, address to, uint256 value)",
+  "function approve(address spender, uint256 value)"
+]);
+
 export function wrapWalletAdapter(
   underlyingAdapter: any,
   config: VeridexGoatConfig
 ): any {
   const policyGate = new VeridexPolicyGate(config.policyRules);
   let activeSessionSigner = config.sessionSigner || new LocalSessionSigner();
-  const evidenceBuilder = new EvidenceBuilder(config.agentId);
 
   const proxy = new Proxy(underlyingAdapter, {
     get(target, prop, receiver) {
@@ -73,15 +80,45 @@ export function wrapWalletAdapter(
       if (prop === "sendTransaction" || prop === "signTransaction") {
         return async (...args: any[]) => {
           const txPayload = args[0] || {};
-          const recipient = txPayload.to || txPayload.recipient || "0x0000000000000000000000000000000000000000";
-          const amount = txPayload.value || txPayload.amount || 0;
-          const asset = txPayload.asset || "GOAT";
-          const chain = typeof underlyingAdapter.getChainId === "function" ? underlyingAdapter.getChainId() : 30;
+          let recipient = txPayload.to || txPayload.recipient || "0x0000000000000000000000000000000000000000";
+          let amount = txPayload.value || txPayload.amount || 0;
+          let asset = txPayload.asset || "GOAT";
+          const chain = typeof underlyingAdapter.getChainId === "function" ? await underlyingAdapter.getChainId() : 30;
+
+          if (txPayload.data && txPayload.data !== "0x") {
+            try {
+              const parsed = ERC20_INTERFACE.parseTransaction({ data: txPayload.data });
+              if (parsed) {
+                if (parsed.name === "transfer") {
+                  recipient = parsed.args[0];
+                  amount = parsed.args[1];
+                } else if (parsed.name === "transferFrom") {
+                  recipient = parsed.args[1];
+                  amount = parsed.args[2];
+                } else if (parsed.name === "approve") {
+                  recipient = parsed.args[0];
+                  amount = parsed.args[1];
+                }
+              }
+            } catch (err) {
+              // Ignore and fall back to original values
+            }
+          }
+
+          const amountUSD = txPayload.amountUSD;
+          if (amountUSD === undefined) {
+            throw new Error("[Veridex Wallet Adapter] Cannot determine transaction USD value: amountUSD must be explicitly provided in transaction payload.");
+          }
+
+          const sessionAddr = await activeSessionSigner.getAddress();
+          const sessionKeyHash = ethers.id(sessionAddr);
+          const evidenceBuilder = new EvidenceBuilder(config.agentId, sessionKeyHash);
 
           // 1. Hot-Path Deterministic Policy Check (< 1ms)
           const evaluation = await policyGate.evaluate({
             recipient,
             amount,
+            amountUSD,
             asset,
             chain,
             metadata: txPayload,
@@ -111,10 +148,16 @@ export function wrapWalletAdapter(
           if (typeof target[prop] === "function") {
             result = await target[prop](...args);
           } else {
-            result = { hash: "0x5d8e2c1a9f4b7306e2a5c1d9b3f80547a6e9c2b1d3f4a80c5e7b1d9a3f60528e" };
+            throw new Error("Underlying wallet adapter function is not invokable");
           }
 
-          const txHash = typeof result === "string" ? result : result?.hash || "0x5d8e2c1a9f4b7306e2a5c1d9b3f80547a6e9c2b1d3f4a80c5e7b1d9a3f60528e";
+          const txHash = typeof result === "string" ? result : result?.hash;
+          if (!txHash) {
+            throw new Error("Wallet adapter failed to return a valid transaction hash");
+          }
+
+          // Commit policy limits now that transaction has successfully broadcasted
+          policyGate.commit(amountUSD, evaluation.evaluatedAt);
 
           // 5. Build & Sign Complete Evidence Bundle
           const bundle = evidenceBuilder.buildSuccess({

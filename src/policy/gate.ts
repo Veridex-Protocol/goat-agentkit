@@ -1,24 +1,95 @@
 import { PaymentContext, PolicyEvaluation, PolicyCheckResult, PolicyRuleConfig } from "./rules.js";
 import { keccak256, toUtf8Bytes } from "ethers";
+import * as fs from "fs";
+import * as path from "path";
+
+// NOTE: All rate-limit counters are in-memory and will be lost on restart.
+// The default FilePolicyStateProvider persists these counters to a local JSON file to prevent limit loss across service restarts.
+export interface PolicyStateProvider {
+  loadState(): { txTimestamps: number[]; dailySpendUSD: number; lastSpendResetDay: number; lastTxTimestamp: number; isCircuitBreakerTripped: boolean };
+  saveState(state: { txTimestamps: number[]; dailySpendUSD: number; lastSpendResetDay: number; lastTxTimestamp: number; isCircuitBreakerTripped: boolean }): void;
+}
+
+export class FilePolicyStateProvider implements PolicyStateProvider {
+  private filePath: string;
+
+  constructor(filePath: string = "veridex-policy-state.json") {
+    this.filePath = path.resolve(filePath);
+  }
+
+  public loadState() {
+    try {
+      if (fs.existsSync(this.filePath)) {
+        const data = fs.readFileSync(this.filePath, "utf-8");
+        return JSON.parse(data);
+      }
+    } catch (e) {
+      // Ignore load errors and fall back to default empty state
+    }
+    return {
+      txTimestamps: [],
+      dailySpendUSD: 0,
+      lastSpendResetDay: Math.floor(Date.now() / 86400000),
+      lastTxTimestamp: 0,
+      isCircuitBreakerTripped: false,
+    };
+  }
+
+  public saveState(state: any): void {
+    try {
+      fs.writeFileSync(this.filePath, JSON.stringify(state, null, 2), "utf-8");
+    } catch (e) {
+      // Ignore save errors
+    }
+  }
+}
 
 export class VeridexPolicyGate {
   private config: PolicyRuleConfig;
+  private stateProvider?: PolicyStateProvider;
   private txTimestamps: number[] = [];
   private dailySpendUSD: number = 0;
-  private lastSpendResetDay: number = new Date().getUTCDay();
+  private lastSpendResetDay: number = Math.floor(Date.now() / 86400000);
   private lastTxTimestamp: number = 0;
   private isCircuitBreakerTripped: boolean = false;
 
-  constructor(config: PolicyRuleConfig) {
+  constructor(config: PolicyRuleConfig, stateProvider?: PolicyStateProvider) {
     this.config = config;
+    this.stateProvider = stateProvider || new FilePolicyStateProvider();
+    this.loadState();
+  }
+
+  private loadState(): void {
+    if (this.stateProvider) {
+      const state = this.stateProvider.loadState();
+      this.txTimestamps = state.txTimestamps || [];
+      this.dailySpendUSD = state.dailySpendUSD || 0;
+      this.lastSpendResetDay = state.lastSpendResetDay ?? Math.floor(Date.now() / 86400000);
+      this.lastTxTimestamp = state.lastTxTimestamp || 0;
+      this.isCircuitBreakerTripped = state.isCircuitBreakerTripped || false;
+    }
+  }
+
+  private saveState(): void {
+    if (this.stateProvider) {
+      this.stateProvider.saveState({
+        txTimestamps: this.txTimestamps,
+        dailySpendUSD: this.dailySpendUSD,
+        lastSpendResetDay: this.lastSpendResetDay,
+        lastTxTimestamp: this.lastTxTimestamp,
+        isCircuitBreakerTripped: this.isCircuitBreakerTripped,
+      });
+    }
   }
 
   public tripCircuitBreaker(): void {
     this.isCircuitBreakerTripped = true;
+    this.saveState();
   }
 
   public resetCircuitBreaker(): void {
     this.isCircuitBreakerTripped = false;
+    this.saveState();
   }
 
   public async evaluate(ctx: PaymentContext): Promise<PolicyEvaluation> {
@@ -26,14 +97,17 @@ export class VeridexPolicyGate {
     const checks: PolicyCheckResult[] = [];
     let riskScore = 0;
 
-    // Reset daily spend if day changed
-    const currentDay = new Date().getUTCDay();
+    // Reset daily spend if day changed (using epoch-day calculation)
+    const currentDay = Math.floor(evaluatedAt / 86400000);
     if (currentDay !== this.lastSpendResetDay) {
       this.dailySpendUSD = 0;
       this.lastSpendResetDay = currentDay;
     }
 
-    const amountUSD = ctx.amountUSD ?? (typeof ctx.amount === "number" ? ctx.amount : Number(ctx.amount) / 1e6);
+    const amountUSD = ctx.amountUSD;
+    if (amountUSD === undefined) {
+      throw new Error("[Veridex Policy Gate] Cannot determine transaction USD value: amountUSD must be explicitly provided.");
+    }
 
     // 0. Circuit Breaker Check
     if (this.isCircuitBreakerTripped) {
@@ -172,10 +246,6 @@ export class VeridexPolicyGate {
 
     if (finalVerdict === "pass") {
       reasons.push("All policy checks passed");
-      // Update running counters on pass
-      this.txTimestamps.push(evaluatedAt);
-      this.dailySpendUSD += amountUSD;
-      this.lastTxTimestamp = evaluatedAt;
     }
 
     const canonicalInput = JSON.stringify({ ctx, checks, evaluatedAt, finalVerdict });
@@ -190,5 +260,18 @@ export class VeridexPolicyGate {
       evaluatedAt,
       traceHash,
     };
+  }
+
+  public commit(amountUSD: number, evaluatedAt: number = Date.now()): void {
+    const currentDay = Math.floor(evaluatedAt / 86400000);
+    if (currentDay !== this.lastSpendResetDay) {
+      this.dailySpendUSD = 0;
+      this.lastSpendResetDay = currentDay;
+    }
+
+    this.txTimestamps.push(evaluatedAt);
+    this.dailySpendUSD += amountUSD;
+    this.lastTxTimestamp = evaluatedAt;
+    this.saveState();
   }
 }

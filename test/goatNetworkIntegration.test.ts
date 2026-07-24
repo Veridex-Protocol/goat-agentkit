@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
   GOAT_ERC8004_ADDRESSES,
   buildERC8004RegistrationJSON,
@@ -9,8 +9,18 @@ import {
   VeridexPolicyGate,
 } from "../src/index.js";
 import { ethers } from "ethers";
+import * as fs from "fs";
 
 describe("GOAT Network ERC-8004 & x402 Integration Spec", () => {
+  beforeEach(() => {
+    try {
+      if (fs.existsSync("veridex-policy-state.json")) {
+        fs.unlinkSync("veridex-policy-state.json");
+      }
+    } catch {}
+    vi.clearAllMocks();
+  });
+
   it("should provide canonical GOAT Network ERC-8004 contract addresses", () => {
     expect(GOAT_ERC8004_ADDRESSES.mainnet.identityRegistry).toBe("0x8004A169FB4a3325136EB29fA0ceB6D2e539a432");
     expect(GOAT_ERC8004_ADDRESSES.mainnet.reputationRegistry).toBe("0x8004BAa17C55a88189AE136b182e5fdA19dE9b63");
@@ -36,15 +46,18 @@ describe("GOAT Network ERC-8004 & x402 Integration Spec", () => {
     const res1 = await gate.evaluate({
       recipient: "0x1111111111111111111111111111111111111111",
       amount: 1,
+      amountUSD: 1,
       asset: "USDC",
       chain: 30,
     });
     expect(res1.verdict).toBe("pass");
+    gate.commit(1, res1.evaluatedAt);
 
     // Second evaluation immediately following should fail due to time-lock cooldown
     const res2 = await gate.evaluate({
       recipient: "0x1111111111111111111111111111111111111111",
       amount: 1,
+      amountUSD: 1,
       asset: "USDC",
       chain: 30,
     });
@@ -56,18 +69,22 @@ describe("GOAT Network ERC-8004 & x402 Integration Spec", () => {
     const highRiskRes = await gate.evaluate({
       recipient: "0x1111111111111111111111111111111111111111",
       amount: 250, // exceeds max limit, causing high risk
+      amountUSD: 250,
       asset: "USDC",
       chain: 30,
     });
     expect(highRiskRes.verdict).toBe("deny");
+    gate.commit(250, highRiskRes.evaluatedAt);
 
     // Subsequent normal transaction should now be blocked by tripped circuit breaker
     const resBlocked = await gate.evaluate({
       recipient: "0x1111111111111111111111111111111111111111",
       amount: 1,
+      amountUSD: 1,
       asset: "USDC",
       chain: 30,
     });
+
     expect(resBlocked.verdict).toBe("deny");
     expect(resBlocked.reasons[0]).toContain("Circuit breaker is active");
   });
@@ -85,9 +102,10 @@ describe("GOAT Network ERC-8004 & x402 Integration Spec", () => {
       validationResponse: vi.fn().mockResolvedValue({ wait: async () => ({ hash: "0xrespHash" }) }),
     };
 
-    vi.spyOn(ethers, "Contract").mockImplementation(() => mockContractInstance as any);
-
     const client = new GoatERC8004Client(mockSigner as any, "testnet3");
+    (client as any).identityContract = mockContractInstance;
+    (client as any).reputationContract = mockContractInstance;
+    (client as any).validationContract = mockContractInstance;
 
     const reg = await client.registerAgent("ipfs://QmSomeURI");
     expect(reg.txHash).toBe("0xregHash");
@@ -142,6 +160,7 @@ describe("GOAT Network ERC-8004 & x402 Integration Spec", () => {
       status: 402,
       accepts: "USDC",
       priceUSDC: "2500000",
+      amountUSD: 2.5,
       payTo: "0x9A7c3f5B2e8D14a6C0f9E7b2D5a8F1c3B4d6E0a2",
       chain: 30,
       scheme: "authorization",
