@@ -1,0 +1,58 @@
+{
+  "name": "@veridex/goat-agentkit",
+  "version": "0.1.0",
+  "description": "Verifiable Economic Policy Enforcement & ERC-8004 Validation Artifacts for GOAT AgentKit",
+  "license": "MIT",
+  "author": "Veridex Team <team@veridex.network>",
+  "homepage": "https://github.com/Veridex-Protocol/goat-agentkit#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Veridex-Protocol/goat-agentkit.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Veridex-Protocol/goat-agentkit/issues"
+  },
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts",
+    "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
+    "test": "vitest run",
+    "lint": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "ethers": "^6.10.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^1.0.0"
+  },
+  "keywords": [
+    "goat-network",
+    "agentkit",
+    "erc8004",
+    "veridex",
+    "x402",
+    "policy",
+    "evidence-bundle"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
