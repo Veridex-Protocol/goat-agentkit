@@ -19,7 +19,7 @@
    - Automatically emits cryptographically signed evidence bundles carrying the agent's `agentId`, policy decision, trace hash, Session Key signature, and optional TEE attestation quotes.
 
 3. **🔗 On-Chain Proof Anchoring**:
-   - Anchors evidence trace hashes directly to `EvidenceRegistry.sol` on GOAT Network Testnet3 (`0x07F608AFf6d63b68029488b726d895c4Bb593038`).
+   - Anchors evidence trace hashes directly to `EvidenceRegistry.sol` on GOAT Network Testnet3 (`0x40D9B16094808Fa48e73598E31AB964Cf15b475f`).
 
 4. **⚡ Zero-Dependency Cryptographic Verifier**:
    - Proof verification requires zero Veridex SDK dependencies — verify any evidence bundle using native `ecrecover` in standard `ethers.js` or `viem`.
@@ -97,7 +97,7 @@ console.log("Verified Session Key Signer:", recoveredAddress);
 
 | Contract | Address | Explorer Link |
 | :--- | :--- | :--- |
-| **`EvidenceRegistry.sol`** | `0x07F608AFf6d63b68029488b726d895c4Bb593038` | [GOAT Testnet3 Explorer](https://explorer.testnet3.goat.network/address/0x07F608AFf6d63b68029488b726d895c4Bb593038) |
+| **`EvidenceRegistry.sol`** | `0x40D9B16094808Fa48e73598E31AB964Cf15b475f` | [GOAT Testnet3 Explorer](https://explorer.testnet3.goat.network/address/0x40D9B16094808Fa48e73598E31AB964Cf15b475f) |
 
 ---
 

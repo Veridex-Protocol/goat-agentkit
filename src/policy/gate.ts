@@ -1,5 +1,7 @@
 import { PaymentContext, PolicyEvaluation, PolicyCheckResult, PolicyRuleConfig } from "./rules.js";
 import { keccak256, toUtf8Bytes } from "ethers";
+import { canonicalizeJson } from "../evidence/builder.js";
+import { safeStringify } from "../utils/serialize.js";
 import * as fs from "fs";
 import * as path from "path";
 
@@ -12,6 +14,7 @@ export interface PolicyStateProvider {
 
 export class FilePolicyStateProvider implements PolicyStateProvider {
   private filePath: string;
+  private saveTimeout: NodeJS.Timeout | null = null;
 
   constructor(filePath: string = "veridex-policy-state.json") {
     this.filePath = path.resolve(filePath);
@@ -36,11 +39,23 @@ export class FilePolicyStateProvider implements PolicyStateProvider {
   }
 
   public saveState(state: any): void {
-    try {
-      fs.writeFileSync(this.filePath, JSON.stringify(state, null, 2), "utf-8");
-    } catch (e) {
-      // Ignore save errors
+    if (state.isCircuitBreakerTripped) {
+      // Persist circuit breaker trips immediately without debouncing
+      try {
+        fs.writeFileSync(this.filePath, safeStringify(state, 2), "utf-8");
+      } catch {}
+      return;
     }
+
+    if (this.saveTimeout) {
+      clearTimeout(this.saveTimeout);
+    }
+
+    this.saveTimeout = setTimeout(() => {
+      try {
+        fs.promises.writeFile(this.filePath, safeStringify(state, 2), "utf-8").catch(() => {});
+      } catch {}
+    }, 50);
   }
 }
 
@@ -248,7 +263,7 @@ export class VeridexPolicyGate {
       reasons.push("All policy checks passed");
     }
 
-    const canonicalInput = JSON.stringify({ ctx, checks, evaluatedAt, finalVerdict });
+    const canonicalInput = canonicalizeJson({ ctx, checks, evaluatedAt, finalVerdict });
     const traceHash = keccak256(toUtf8Bytes(canonicalInput));
 
     return {

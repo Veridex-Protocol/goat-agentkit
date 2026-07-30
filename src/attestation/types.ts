@@ -8,7 +8,8 @@ export type TEEProviderType =
   | "aws-nitro-enclave"
   | "phala-dstack"
   | "nillion-secret-vault"
-  | "mock-simulator";
+  | "mock-simulator"
+  | "software";
 
 export interface TEEAttestationReport {
   provider: TEEProviderType;

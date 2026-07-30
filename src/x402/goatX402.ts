@@ -3,6 +3,7 @@ import { VeridexPolicyGate } from "../policy/gate.js";
 import { PolicyRuleConfig } from "../policy/rules.js";
 import { EvidenceBuilder, EvidenceBundle } from "../evidence/builder.js";
 import { LocalSessionSigner, SessionSigner } from "../evidence/signer.js";
+import { HumanApprovalRequiredError } from "../wrapper.js";
 
 export interface X402Challenge {
   status: number;
@@ -54,7 +55,7 @@ export function parseX402Challenge(responseHeaders: Record<string, string>, resp
         amount: String(decoded.amount || decoded.priceUSDC || "0"),
         amountUSD,
         payTo: decoded.payTo,
-        chain: decoded.chain || 30,
+        chain: decoded.chain || 48816,
         scheme: decoded.scheme || "authorization",
         nonce: decoded.nonce,
         validBefore: decoded.validBefore,
@@ -78,7 +79,7 @@ export function parseX402Challenge(responseHeaders: Record<string, string>, resp
       amount: String(responseBody.priceUSDC || responseBody.amount || "0"),
       amountUSD,
       payTo: responseBody.payTo,
-      chain: responseBody.chain || 30,
+      chain: responseBody.chain || 48816,
       scheme: responseBody.scheme || "authorization",
       nonce: responseBody.nonce,
       validBefore: responseBody.validBefore,
@@ -89,15 +90,28 @@ export function parseX402Challenge(responseHeaders: Record<string, string>, resp
 }
 
 /**
+ * Helper to determine if an action is a non-spending query/status/cancel action.
+ */
+function isNonSpendingAction(actionName: string): boolean {
+  const nameLower = actionName.toLowerCase();
+  return (
+    nameLower.includes("status") ||
+    nameLower.includes("cancel") ||
+    nameLower.includes("query") ||
+    nameLower.includes("get") ||
+    nameLower.includes("read")
+  );
+}
+
+/**
  * Intercepts x402 payment actions and evaluates economic policy before execution.
- * If policy denies, returns structured POLICY_BLOCKED result and emits signed denial Evidence Bundle.
- * If policy allows, executes original action, emits signed success Evidence Bundle, and attaches it.
+ * If policy denies or escalates, handles accordingly and emits signed Evidence Bundles.
  */
 export function wrapX402PaymentActions(
   actions: ActionDefinition[] | Record<string, ActionDefinition>,
   policyGate: VeridexPolicyGate,
   sessionSigner?: SessionSigner,
-  agentId: string = "erc8004:8453:1042",
+  agentId: string = "erc8004:48816:1042",
   onBundleEmitted?: (bundle: EvidenceBundle) => void
 ): ActionDefinition[] {
   const signer = sessionSigner || new LocalSessionSigner();
@@ -110,15 +124,20 @@ export function wrapX402PaymentActions(
     return {
       ...action,
       execute: async (input: any, context?: any) => {
+        // Skip spending policy checks for non-spending actions (status queries, order cancellations)
+        if (isNonSpendingAction(action.name)) {
+          return await action.execute(input, context);
+        }
+
         const recipient =
           input?.to || input?.recipient || input?.payTo || "0x0000000000000000000000000000000000000000";
         const amountUSD = input?.amountUSD;
         if (amountUSD === undefined) {
-          throw new Error("[Veridex x402 Actions] Cannot determine payment USD value: amountUSD must be explicitly provided in action inputs.");
+          throw new Error(`[Veridex x402 Actions] Cannot determine payment USD value for action '${action.name}': amountUSD must be explicitly provided in action inputs.`);
         }
         const amount = String(input?.amount || input?.value || amountUSD);
         const asset = input?.asset || input?.accepts || "USDC";
-        const chain = input?.chain || 8453;
+        const chain = input?.chain || 48816;
 
         const sessionAddr = await signer.getAddress();
         const sessionKeyHash = ethers.id(sessionAddr);
@@ -134,7 +153,7 @@ export function wrapX402PaymentActions(
           metadata: { actionName: action.name, input },
         });
 
-        // 2. Pre-Signature Enforcement Gate: Denial
+        // 2a. Pre-Signature Enforcement Gate: Denial
         if (evaluation.verdict === "deny") {
           const denialBundle = evidenceBuilder.buildDenial({
             payload: { to: recipient, amount, asset, chain },
@@ -151,6 +170,27 @@ export function wrapX402PaymentActions(
             reasons: evaluation.reasons,
             evidenceBundle: signedBundle,
             error: `[Veridex Policy Gate] Payment blocked: ${evaluation.reasons.join(", ")}`,
+          };
+        }
+
+        // 2b. Pre-Signature Enforcement Gate: Escalation
+        if (evaluation.verdict === "escalate") {
+          const escalationBundle = evidenceBuilder.buildDenial({
+            payload: { to: recipient, amount, asset, chain },
+            evaluation,
+          });
+          const signedBundle = await signer.signBundle(escalationBundle);
+          if (onBundleEmitted) {
+            onBundleEmitted(signedBundle);
+          }
+
+          return {
+            status: "PENDING_APPROVAL",
+            blocked: true,
+            verdict: "escalate",
+            reasons: evaluation.reasons,
+            evidenceBundle: signedBundle,
+            error: `[Veridex Policy Gate] Payment requires human approval: ${evaluation.reasons.join(", ")}`,
           };
         }
 
@@ -265,6 +305,28 @@ export class VeridexGoatX402Payer {
       throw error;
     }
 
+    if (evaluation.verdict === "escalate") {
+      const escalationBundle = evidenceBuilder.buildDenial({
+        payload: {
+          to: challenge.payTo,
+          amount: challenge.amount,
+          asset: challenge.accepts,
+          chain: challenge.chain,
+        },
+        evaluation,
+      });
+
+      const signedBundle = await this.sessionSigner.signBundle(escalationBundle);
+      if (this.onBundleEmitted) {
+        this.onBundleEmitted(signedBundle);
+      }
+
+      throw new HumanApprovalRequiredError(
+        `[Veridex x402 Policy Escalation] Human approval required: ${evaluation.reasons.join(", ")}`,
+        evaluation
+      );
+    }
+
     let txHash: string | undefined;
     if (walletAdapter && typeof walletAdapter.sendTransaction === "function") {
       const res = await walletAdapter.sendTransaction({
@@ -306,4 +368,3 @@ export class VeridexGoatX402Payer {
     };
   }
 }
-

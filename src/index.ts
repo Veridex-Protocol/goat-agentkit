@@ -12,3 +12,4 @@ export * from "./attestation/nillionSecretVault.js";
 export * from "./attestation/providerFactory.js";
 export * from "./erc8004/goatContracts.js";
 export * from "./x402/goatX402.js";
+export * from "./utils/serialize.js";

@@ -1,11 +1,12 @@
-import { keccak256, toUtf8Bytes, recoverAddress, getBytes, hashMessage } from "ethers";
+import { keccak256, toUtf8Bytes, recoverAddress, getBytes, hashMessage, ethers } from "ethers";
 import { PolicyEvaluation, PaymentContext } from "../policy/rules.js";
 
 export function canonicalizeJson(obj: any): string {
   if (obj === null) return "null";
+  if (typeof obj === "bigint") return JSON.stringify(obj.toString());
   if (typeof obj !== "object") return JSON.stringify(obj);
   if (Array.isArray(obj)) {
-    return "[" + obj.map(item => canonicalizeJson(item)).join(",") + "]";
+    return "[" + obj.map((item) => canonicalizeJson(item)).join(",") + "]";
   }
   const keys = Object.keys(obj).sort();
   const parts: string[] = [];
@@ -63,7 +64,7 @@ export interface EvidenceBundle {
     contentId: string;
     storedAt: number;
     immutable: boolean;
-  };
+  } | null;
   assembledAt: number;
   bundleHash?: string;
 }
@@ -84,6 +85,7 @@ export class EvidenceBuilder {
     payload: any;
     evaluation: PolicyEvaluation;
     traceId?: string;
+    runtime?: string;
   }): EvidenceBundle {
     const timestamp = Date.now();
     const traceId = params.traceId || crypto.randomUUID();
@@ -98,12 +100,12 @@ export class EvidenceBuilder {
         recipient: params.payload.to || params.payload.recipient,
         asset: params.payload.asset || "GOAT",
         amount: String(params.payload.value || params.payload.amount || "0"),
-        chain: params.payload.chain || 30,
+        chain: params.payload.chain || 48816,
         protocol: "x402",
       },
       policyEvaluation: params.evaluation,
       environment: {
-        runtime: "clawup-azure-confidential-container",
+        runtime: params.runtime || (process.env.CLOUD_MODE === "true" ? "tee-attest-environment" : "node-runtime"),
       },
     };
 
@@ -130,6 +132,7 @@ export class EvidenceBuilder {
     settlementTxHash: string;
     teeAttestation?: any;
     traceId?: string;
+    runtime?: string;
   }): EvidenceBundle {
     const timestamp = Date.now();
     const traceId = params.traceId || crypto.randomUUID();
@@ -144,12 +147,12 @@ export class EvidenceBuilder {
         recipient: params.payload.to || params.payload.recipient,
         asset: params.payload.asset || "GOAT",
         amount: String(params.payload.value || params.payload.amount || "0"),
-        chain: params.payload.chain || 30,
+        chain: params.payload.chain || 48816,
         protocol: "x402",
       },
       policyEvaluation: params.evaluation,
       environment: {
-        runtime: "clawup-azure-confidential-container",
+        runtime: params.runtime || (params.teeAttestation ? "azure-sev-snp-tee" : "node-runtime"),
         teeAttestation: params.teeAttestation,
       },
     };
@@ -163,16 +166,11 @@ export class EvidenceBuilder {
       verdict: params.evaluation,
       settlementProof: {
         txHash: params.settlementTxHash,
-        traceHashInCalldata: true,
-        chain: params.payload.chain || 30,
+        traceHashInCalldata: false,
+        chain: params.payload.chain || 48816,
         explorerUrl: `https://explorer.testnet3.goat.network/tx/${params.settlementTxHash}`,
       },
-      storageReceipt: {
-        provider: "filecoin",
-        contentId: `bafybeig${traceHash.slice(2, 20)}`,
-        storedAt: timestamp,
-        immutable: true,
-      },
+      storageReceipt: null,
       assembledAt: timestamp,
     };
 
@@ -183,13 +181,12 @@ export class EvidenceBuilder {
     return finalBundle;
   }
 
-
   /**
-   * Standalone zero-dependency verification helper using keccak256 + ecrecover only.
+   * Verification helper checking trace hash consistency and cryptographic signature recovery.
    */
-  public static verifyBundle(bundle: EvidenceBundle): { valid: boolean; recoveredAddress?: string } {
-    if (!bundle.signature || !bundle.traceHash) {
-      return { valid: false };
+  public static verifyBundle(bundle: EvidenceBundle): { valid: boolean; recoveredAddress?: string; reason?: string } {
+    if (!bundle || !bundle.signature || !bundle.traceHash) {
+      return { valid: false, reason: "Missing signature or traceHash" };
     }
 
     try {
@@ -198,12 +195,25 @@ export class EvidenceBuilder {
       const computedHash = keccak256(toUtf8Bytes(canonicalTrace));
 
       const hashValid = computedHash.toLowerCase() === bundle.traceHash.toLowerCase();
+      if (!hashValid) {
+        return { valid: false, recoveredAddress, reason: "Trace hash mismatch" };
+      }
+
+      if (bundle.trace?.sessionKeyHash) {
+        const expectedHash = ethers.id(recoveredAddress).toLowerCase();
+        const rawAddr = recoveredAddress.toLowerCase();
+        const givenHash = bundle.trace.sessionKeyHash.toLowerCase();
+        if (givenHash !== expectedHash && givenHash !== rawAddr) {
+          return { valid: false, recoveredAddress, reason: "Signer address does not match trace sessionKeyHash" };
+        }
+      }
+
       return {
-        valid: hashValid && !!recoveredAddress,
+        valid: true,
         recoveredAddress,
       };
-    } catch {
-      return { valid: false };
+    } catch (e: any) {
+      return { valid: false, reason: e.message || "Verification exception" };
     }
   }
 }

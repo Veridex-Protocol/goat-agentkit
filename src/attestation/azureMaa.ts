@@ -3,12 +3,16 @@ import fs from "fs";
 import { execSync } from "child_process";
 import { AttestationProvider, TEEAttestationReport, TEEProviderType } from "./types.js";
 
+function decodeBase64Url(str: string): string {
+  let base64 = str.replace(/-/g, "+").replace(/_/g, "/");
+  while (base64.length % 4 !== 0) {
+    base64 += "=";
+  }
+  return Buffer.from(base64, "base64").toString("utf-8");
+}
+
 /**
  * Production Live Azure Confidential Containers Attestation Driver
- *
- * Intercepts live AMD SEV-SNP / Intel TDX hardware attestation quotes via two live mechanisms:
- * 1. Azure IMDS Guest Attestation Endpoint (HTTP POST to http://169.254.169.254/metadata/attestation/user-data)
- * 2. Direct Linux kernel hardware device driver (/dev/sev-guest or /dev/tdx-guest)
  */
 export class AzureMaaAttestationProvider implements AttestationProvider {
   private imdsEndpoint: string;
@@ -67,14 +71,12 @@ export class AzureMaaAttestationProvider implements AttestationProvider {
         }
       }
     } catch {
-      // IMDS unavailable (running outside Azure CC)
+      // IMDS unavailable
     }
 
-    // Strategy 2: Direct Linux Device Driver (/dev/sev-guest) via system tools/ioctl
+    // Strategy 2: Direct Linux Device Driver (/dev/sev-guest)
     try {
       if (fs.existsSync(this.devSevGuestPath)) {
-        // Character devices like /dev/sev-guest require specific ioctl calls.
-        // We use the Azure Guest Attestation CLI/tool to query the quote securely.
         const output = execSync(`/usr/bin/azguestattest --user-data ${boundHash} --api-version 2021-01-01`, { stdio: "pipe" });
         const res = JSON.parse(output.toString("utf-8"));
         const hexQuote = res.quote || res.attestationToken || res.token || res.raw_quote;
@@ -88,33 +90,33 @@ export class AzureMaaAttestationProvider implements AttestationProvider {
           timestamp,
         };
       }
-    } catch (e) {
-      // Hardware device or tool execution failed
+    } catch {
+      // Hardware device unavailable
     }
 
-    if (process.env.NODE_ENV === "production") {
+    if (process.env.NODE_ENV === "production" && process.env.STRICT_TEE === "true") {
       throw new Error("[Azure TEE Driver] Production Environment Error: Hardware attestation failed or SEV-SNP device is unavailable.");
     }
 
-    // Fallback if hardware TEE device is not present (local dev)
+    // Fallback if hardware TEE device is not present (software attestation mode)
     return {
-      provider: "azure-maa/sev-snp",
-      quote: "LIVE_HARDWARE_TEE_UNAVAILABLE_ENV_LOCAL",
-      measurement: "0x2b8d4056a1f3e7c9b0d2854f6a9e1c3b7d05f28a4c6e1b9d3f705a2c8f3a1c7e9",
+      provider: "software",
+      quote: "SOFTWARE_ATTESTATION_ONLY",
+      measurement: "0x0000000000000000000000000000000000000000000000000000000000000000",
       boundHash,
       timestamp,
     };
   }
 
   /**
-   * Parses Microsoft Azure Attestation JWT token and extracts SEV-SNP launch measurement.
+   * Parses Microsoft Azure Attestation JWT token with URL-safe base64 decoding.
    */
   private parseMaaJwt(jwt: string): { measurement?: string; certChain?: string[] } {
     try {
       const parts = jwt.split(".");
       if (parts.length >= 2) {
-        const payload = JSON.parse(Buffer.from(parts[1], "base64").toString("utf-8"));
-        const header = JSON.parse(Buffer.from(parts[0], "base64").toString("utf-8"));
+        const payload = JSON.parse(decodeBase64Url(parts[1]));
+        const header = JSON.parse(decodeBase64Url(parts[0]));
 
         const measurement =
           payload["x-ms-sevsnpvm-launchmeasurement"] ||
@@ -132,9 +134,6 @@ export class AzureMaaAttestationProvider implements AttestationProvider {
   }
 }
 
-/**
- * Backwards compatibility helper class for Veridex × GOAT Network Integration.
- */
 export class AzureMaaAttestation {
   public static async getQuote(traceHash: string): Promise<any> {
     const provider = new AzureMaaAttestationProvider();
@@ -147,4 +146,3 @@ export class AzureMaaAttestation {
     };
   }
 }
-
