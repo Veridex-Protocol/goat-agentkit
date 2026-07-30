@@ -133,6 +133,7 @@ export class EvidenceBuilder {
     teeAttestation?: any;
     traceId?: string;
     runtime?: string;
+    storageCid?: string;
   }): EvidenceBundle {
     const timestamp = Date.now();
     const traceId = params.traceId || crypto.randomUUID();
@@ -160,6 +161,15 @@ export class EvidenceBuilder {
     const canonicalTrace = canonicalizeJson(trace);
     const traceHash = keccak256(toUtf8Bytes(canonicalTrace));
 
+    const storageReceipt = params.storageCid
+      ? {
+          provider: "ipfs",
+          contentId: params.storageCid,
+          storedAt: timestamp,
+          immutable: true,
+        }
+      : null;
+
     const finalBundle: EvidenceBundle = {
       trace,
       traceHash,
@@ -170,7 +180,7 @@ export class EvidenceBuilder {
         chain: params.payload.chain || 48816,
         explorerUrl: `https://explorer.testnet3.goat.network/tx/${params.settlementTxHash}`,
       },
-      storageReceipt: null,
+      storageReceipt,
       assembledAt: timestamp,
     };
 
@@ -182,7 +192,7 @@ export class EvidenceBuilder {
   }
 
   /**
-   * Verification helper checking trace hash consistency and cryptographic signature recovery.
+   * Full verification of bundle integrity and signature recovery against session key hash.
    */
   public static verifyBundle(bundle: EvidenceBundle): { valid: boolean; recoveredAddress?: string; reason?: string } {
     if (!bundle || !bundle.signature || !bundle.traceHash) {
@@ -197,6 +207,25 @@ export class EvidenceBuilder {
       const hashValid = computedHash.toLowerCase() === bundle.traceHash.toLowerCase();
       if (!hashValid) {
         return { valid: false, recoveredAddress, reason: "Trace hash mismatch" };
+      }
+
+      if (bundle.bundleHash) {
+        const copy = { ...bundle, signature: undefined };
+        delete (copy as any).signature;
+
+        const copyBundle = {
+          trace: bundle.trace,
+          traceHash: bundle.traceHash,
+          verdict: bundle.verdict,
+          settlementProof: bundle.settlementProof,
+          storageReceipt: bundle.storageReceipt,
+          assembledAt: bundle.assembledAt,
+        };
+        const computedBundleHash = keccak256(toUtf8Bytes(canonicalizeJson(copyBundle)));
+
+        if (computedBundleHash.toLowerCase() !== bundle.bundleHash.toLowerCase()) {
+          return { valid: false, recoveredAddress, reason: "Bundle payload mutation detected" };
+        }
       }
 
       if (bundle.trace?.sessionKeyHash) {

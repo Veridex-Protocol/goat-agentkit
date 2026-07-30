@@ -2,11 +2,10 @@ import { PaymentContext, PolicyEvaluation, PolicyCheckResult, PolicyRuleConfig }
 import { keccak256, toUtf8Bytes } from "ethers";
 import { canonicalizeJson } from "../evidence/builder.js";
 import { safeStringify } from "../utils/serialize.js";
+import { NormalizedAction } from "../types/action.js";
 import * as fs from "fs";
 import * as path from "path";
 
-// NOTE: All rate-limit counters are in-memory and will be lost on restart.
-// The default FilePolicyStateProvider persists these counters to a local JSON file to prevent limit loss across service restarts.
 export interface PolicyStateProvider {
   loadState(): { txTimestamps: number[]; dailySpendUSD: number; lastSpendResetDay: number; lastTxTimestamp: number; isCircuitBreakerTripped: boolean };
   saveState(state: { txTimestamps: number[]; dailySpendUSD: number; lastSpendResetDay: number; lastTxTimestamp: number; isCircuitBreakerTripped: boolean }): void;
@@ -27,7 +26,7 @@ export class FilePolicyStateProvider implements PolicyStateProvider {
         return JSON.parse(data);
       }
     } catch (e) {
-      // Ignore load errors and fall back to default empty state
+      // Fallback
     }
     return {
       txTimestamps: [],
@@ -40,7 +39,6 @@ export class FilePolicyStateProvider implements PolicyStateProvider {
 
   public saveState(state: any): void {
     if (state.isCircuitBreakerTripped) {
-      // Persist circuit breaker trips immediately without debouncing
       try {
         fs.writeFileSync(this.filePath, safeStringify(state, 2), "utf-8");
       } catch {}
@@ -67,6 +65,8 @@ export class VeridexPolicyGate {
   private lastSpendResetDay: number = Math.floor(Date.now() / 86400000);
   private lastTxTimestamp: number = 0;
   private isCircuitBreakerTripped: boolean = false;
+  private reservedActionIds: Map<string, number> = new Map();
+  private processedActionIds: Set<string> = new Set();
 
   constructor(config: PolicyRuleConfig, stateProvider?: PolicyStateProvider) {
     this.config = config;
@@ -107,22 +107,54 @@ export class VeridexPolicyGate {
     this.saveState();
   }
 
-  public async evaluate(ctx: PaymentContext): Promise<PolicyEvaluation> {
+  /**
+   * Atomic reservation lock to prevent concurrent daily spend race conditions (CAS).
+   */
+  public reserve(actionId: string, amountUSD: number): boolean {
+    if (this.processedActionIds.has(actionId)) {
+      throw new Error(`DUPLICATE_ACTION: Action ${actionId} has already been processed.`);
+    }
+
+    if (this.config.spendingLimits) {
+      const { maxDailyUSD } = this.config.spendingLimits;
+      if (this.dailySpendUSD + amountUSD > maxDailyUSD) {
+        return false;
+      }
+    }
+
+    this.dailySpendUSD += amountUSD;
+    this.reservedActionIds.set(actionId, amountUSD);
+    this.saveState();
+    return true;
+  }
+
+  public releaseReservation(actionId: string): void {
+    const reservedAmount = this.reservedActionIds.get(actionId);
+    if (reservedAmount !== undefined) {
+      this.dailySpendUSD = Math.max(0, this.dailySpendUSD - reservedAmount);
+      this.reservedActionIds.delete(actionId);
+      this.saveState();
+    }
+  }
+
+  public async evaluate(ctxInput: PaymentContext | NormalizedAction): Promise<PolicyEvaluation> {
     const evaluatedAt = Date.now();
     const checks: PolicyCheckResult[] = [];
     let riskScore = 0;
 
-    // Reset daily spend if day changed (using epoch-day calculation)
+    const ctx = ctxInput as any;
     const currentDay = Math.floor(evaluatedAt / 86400000);
     if (currentDay !== this.lastSpendResetDay) {
       this.dailySpendUSD = 0;
       this.lastSpendResetDay = currentDay;
     }
 
-    const amountUSD = ctx.amountUSD;
-    if (amountUSD === undefined) {
-      throw new Error("[Veridex Policy Gate] Cannot determine transaction USD value: amountUSD must be explicitly provided.");
+    const amountUSD = ctx.usdValue !== undefined ? ctx.usdValue : ctx.amountUSD;
+    if (amountUSD === undefined || isNaN(amountUSD) || amountUSD < 0) {
+      throw new Error("INVALID_AMOUNT: Cannot evaluate policy on missing, invalid, or negative amountUSD.");
     }
+
+    const recipient = ctx.to || ctx.recipient || "0x0000000000000000000000000000000000000000";
 
     // 0. Circuit Breaker Check
     if (this.isCircuitBreakerTripped) {
@@ -154,28 +186,29 @@ export class VeridexPolicyGate {
     }
 
     // 1. Asset Whitelist Check
+    const assetStr = ctx.asset || "GOAT";
     if (this.config.allowedAssets && this.config.allowedAssets.length > 0) {
-      const isAllowed = this.config.allowedAssets.includes(ctx.asset.toUpperCase());
+      const isAllowed = this.config.allowedAssets.includes(assetStr.toUpperCase());
       checks.push({
         ruleId: "asset-whitelist",
         ruleName: "Asset Whitelist",
         passed: isAllowed,
         verdict: isAllowed ? "pass" : "deny",
-        reason: isAllowed ? `${ctx.asset} is an allowed asset` : `${ctx.asset} is not in allowed asset list`,
+        reason: isAllowed ? `${assetStr} is an allowed asset` : `${assetStr} is not in allowed asset list`,
         riskContribution: isAllowed ? 0 : 100,
       });
     }
 
     // 2. Counterparty / Sanctions Check
     if (this.config.sanctionedRecipients && this.config.sanctionedRecipients.length > 0) {
-      const recipientLower = ctx.recipient.toLowerCase();
-      const isSanctioned = this.config.sanctionedRecipients.some(addr => addr.toLowerCase() === recipientLower);
+      const recipientLower = recipient.toLowerCase();
+      const isSanctioned = this.config.sanctionedRecipients.some((addr: string) => addr.toLowerCase() === recipientLower);
       checks.push({
         ruleId: "counterparty-sanctions",
         ruleName: "Counterparty / Sanctions",
         passed: !isSanctioned,
         verdict: isSanctioned ? "deny" : "pass",
-        reason: isSanctioned ? `Recipient ${ctx.recipient} is on sanctions / block list` : `Recipient ${ctx.recipient} clear of sanctions`,
+        reason: isSanctioned ? `Recipient ${recipient} is on sanctions / block list` : `Recipient ${recipient} clear of sanctions`,
         riskContribution: isSanctioned ? 100 : 0,
       });
     }
@@ -250,7 +283,6 @@ export class VeridexPolicyGate {
       }
     }
 
-    // Determine Circuit Breaker tripping post-evaluation
     if (this.config.circuitBreaker && this.config.circuitBreaker.tripOnHighRiskScore) {
       if (riskScore >= this.config.circuitBreaker.tripOnHighRiskScore) {
         this.isCircuitBreakerTripped = true;
@@ -277,7 +309,7 @@ export class VeridexPolicyGate {
     };
   }
 
-  public commit(amountUSD: number, evaluatedAt: number = Date.now()): void {
+  public commit(amountUSD: number, evaluatedAt: number = Date.now(), actionId?: string): void {
     const currentDay = Math.floor(evaluatedAt / 86400000);
     if (currentDay !== this.lastSpendResetDay) {
       this.dailySpendUSD = 0;
@@ -285,7 +317,12 @@ export class VeridexPolicyGate {
     }
 
     this.txTimestamps.push(evaluatedAt);
-    this.dailySpendUSD += amountUSD;
+    if (actionId && this.reservedActionIds.has(actionId)) {
+      this.reservedActionIds.delete(actionId);
+      this.processedActionIds.add(actionId);
+    } else {
+      this.dailySpendUSD += amountUSD;
+    }
     this.lastTxTimestamp = evaluatedAt;
     this.saveState();
   }
