@@ -4,6 +4,7 @@ import { PolicyRuleConfig } from "./policy/rules.js";
 import { EvidenceBuilder } from "./evidence/builder.js";
 import { LocalSessionSigner, SessionSigner } from "./evidence/signer.js";
 import { AzureMaaAttestation } from "./attestation/azureMaa.js";
+import { getGlobalRevocationList } from "./session/revocation.js";
 
 export interface VeridexGoatConfig {
   agentId: string; // e.g. "erc8004:48816:1042"
@@ -120,11 +121,41 @@ export function wrapWalletAdapter(
         };
       }
 
+      // VD-GOAT-012 fix: Session revocation API
+      if (prop === "__revokeSession") {
+        return async (address?: string, reason?: string) => {
+          const revocationList = getGlobalRevocationList();
+          const targetAddr = address || (await activeSessionSigner.getAddress());
+          revocationList.revoke(targetAddr, reason, config.agentId);
+          return { revoked: targetAddr, at: Date.now() };
+        };
+      }
+
+      if (prop === "__isSessionRevoked") {
+        return async (address?: string) => {
+          const revocationList = getGlobalRevocationList();
+          const targetAddr = address || (await activeSessionSigner.getAddress());
+          return revocationList.isRevoked(targetAddr);
+        };
+      }
+
       if (typeof prop === "string" && interceptedMethods.includes(prop)) {
         return async (...args: any[]) => {
+          // VD-GOAT-012 fix: Check session expiry
           if (sessionExpiresAt && Date.now() > sessionExpiresAt) {
             const addr = await activeSessionSigner.getAddress().catch(() => "unknown");
             throw new SessionExpiredError(addr, sessionExpiresAt);
+          }
+
+          // VD-GOAT-012 fix: Check session revocation
+          const sessionAddr = await activeSessionSigner.getAddress().catch(() => null);
+          if (sessionAddr) {
+            const revocationList = getGlobalRevocationList();
+            if (revocationList.isRevoked(sessionAddr)) {
+              throw new Error(
+                `[Veridex Session Error] Session key ${sessionAddr} has been revoked and cannot be used`
+              );
+            }
           }
 
           const txPayload = args[0] || {};
