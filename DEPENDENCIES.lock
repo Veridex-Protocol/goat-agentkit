@@ -1,6 +1,6 @@
 # Dependency Lock Documentation
-# Generated: 2026-08-05
-# Commit: 356b0fe
+# Generated: 2026-08-05 (Final Update)
+# Commit: 159172c
 # Purpose: VD-GOAT-014 fix - Reproducible build verification
 
 ## Production Dependencies
@@ -70,6 +70,20 @@ For production builds, recommend:
 
 ## Audit Trail
 
-- VGA-SEC-2026-0730 audit performed on commit 85b4cff
-- Security fixes applied in commits: b5ef772, 99c9789, 27e0da4, 356b0fe
-- This lock file represents state at 356b0fe
+- VGA-SEC-2026-0730 audit performed on commit 85b4cff (July 30, 2026)
+- Security fixes applied August 5, 2026:
+  - b5ef772: VD-GOAT-005 (Atomic budget reservation)
+  - 99c9789: VD-GOAT-003 (EIP-712 bundle signatures)
+  - 27e0da4: VD-GOAT-009 (Registry authorization)
+  - 356b0fe: VD-GOAT-007 (JWT claims validation - partial)
+  - 0afdd3e: VD-GOAT-014 (Dependency lock documentation)
+  - 97e7b81: VD-GOAT-002 (On-chain mandate verification)
+  - 9494eb9: VD-GOAT-008 (x402 challenge authentication)
+  - 6fafe4f: VD-GOAT-007 (RS256 signature verification - complete)
+  - 1a7bbe6: VD-GOAT-006 (Complete signature interception)
+  - bba5dab: VD-GOAT-015 (Remove unsafe defaults)
+  - 49f70c9: VD-GOAT-013 (Input validation and rate limiting)
+  - af1a9d1: VD-GOAT-011 (Atomic state persistence)
+  - 159172c: VD-GOAT-012 (Session revocation enforcement)
+- This lock file represents state at 159172c
+- All 15 security findings now addressed
