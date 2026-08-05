@@ -20,7 +20,8 @@ export const GOAT_ERC8004_ADDRESSES = {
     identityRegistry: getChecksumAddress("0x8004A169FB4a3325136EB29fA0ceB6D2e539a432"),
     reputationRegistry: getChecksumAddress("0x8004BAa17C55a88189AE136b182e5fdA19dE9b63"),
     validationRegistry: getChecksumAddress("0x8004cabcde123456789012345678901234567890"),
-    evidenceRegistry: "0x0000000000000000000000000000000000000000",
+    // VD-GOAT-015 fix: Remove zero address placeholder - MUST set via config or env
+    evidenceRegistry: process.env.GOAT_MAINNET_EVIDENCE_REGISTRY || "",
     agentRegistryId: "eip155:2345:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432",
   },
   testnet3: {

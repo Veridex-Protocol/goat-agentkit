@@ -29,15 +29,29 @@ export class LocalSessionSigner implements SessionSigner {
   private wallet: any;
 
   constructor(privateKey?: string) {
-    if (privateKey && typeof privateKey === "string" && privateKey.trim().length > 0) {
-      try {
-        const formattedKey = privateKey.trim().startsWith("0x") ? privateKey.trim() : `0x${privateKey.trim()}`;
-        this.wallet = new Wallet(formattedKey);
-      } catch (err: any) {
-        throw new Error(`[LocalSessionSigner] Invalid private key provided: ${err.message}`);
+    // VD-GOAT-015 fix: Remove unsafe random wallet fallback
+    if (!privateKey || typeof privateKey !== "string" || privateKey.trim().length === 0) {
+      if (process.env.NODE_ENV === "production") {
+        throw new Error(
+          "[LocalSessionSigner] PRODUCTION ERROR: No private key provided. " +
+          "Random wallet generation is disabled in production. " +
+          "Provide a secure private key via environment variable or config."
+        );
       }
-    } else {
+      // Only allow random wallets in development/test
+      console.warn(
+        "[LocalSessionSigner] WARNING: Using random ephemeral wallet for development. " +
+        "This will fail in production. Set a proper private key."
+      );
       this.wallet = Wallet.createRandom();
+      return;
+    }
+
+    try {
+      const formattedKey = privateKey.trim().startsWith("0x") ? privateKey.trim() : `0x${privateKey.trim()}`;
+      this.wallet = new Wallet(formattedKey);
+    } catch (err: any) {
+      throw new Error(`[LocalSessionSigner] Invalid private key provided: ${err.message}`);
     }
   }
 
