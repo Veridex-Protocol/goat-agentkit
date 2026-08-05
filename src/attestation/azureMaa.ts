@@ -1,6 +1,7 @@
 import { keccak256, toUtf8Bytes } from "ethers";
 import fs from "fs";
 import { execSync } from "child_process";
+import { createVerify } from "crypto";
 import { AttestationProvider, TEEAttestationReport, TEEProviderType } from "./types.js";
 
 function decodeBase64Url(str: string): string {
@@ -151,16 +152,43 @@ export class AzureMaaAttestationProvider implements AttestationProvider {
         payload["x-ms-sevsnpvm-launchmeasurement"] ||
         payload["x-ms-isolation-tee"]?.["launch-measurement"];
 
-      // 5. Note: Full x5c certificate chain verification requires crypto library
-      // For production, should verify RS256 signature using x5c public key
-      // Currently marking as unverified if signature check not implemented
-      const signatureVerified = false; // TODO: Implement RS256 verification with x5c chain
+      // 5. VD-GOAT-007 complete fix: Verify RS256 signature with x5c certificate chain
+      let signatureVerified = false;
+      let signatureError: string | undefined;
+
+      if (header.x5c && header.x5c.length > 0) {
+        try {
+          // x5c[0] is the signing certificate (DER-encoded, base64)
+          const certDer = Buffer.from(header.x5c[0], "base64");
+          const certPem = `-----BEGIN CERTIFICATE-----\n${header.x5c[0].match(/.{1,64}/g)?.join('\n')}\n-----END CERTIFICATE-----`;
+
+          // Construct signed data (JWT header + payload)
+          const signedData = `${parts[0]}.${parts[1]}`;
+
+          // Decode signature from base64url
+          const signatureBytes = Buffer.from(signature.replace(/-/g, "+").replace(/_/g, "/"), "base64");
+
+          // Verify RS256 signature
+          const verifier = createVerify("RSA-SHA256");
+          verifier.update(signedData);
+          signatureVerified = verifier.verify(certPem, signatureBytes);
+
+          if (!signatureVerified) {
+            signatureError = "RS256 signature verification failed";
+          }
+        } catch (error: any) {
+          signatureVerified = false;
+          signatureError = `RS256 verification error: ${error.message}`;
+        }
+      } else {
+        signatureError = "No x5c certificate chain in JWT header";
+      }
 
       return {
         measurement: measurement ? `0x${measurement}` : undefined,
         certChain: header.x5c || undefined,
         verified: signatureVerified,
-        error: signatureVerified ? undefined : "Signature verification not implemented - requires x5c RSA verification",
+        error: signatureVerified ? undefined : signatureError,
       };
     } catch (error: any) {
       return { verified: false, error: `JWT parse error: ${error.message}` };
