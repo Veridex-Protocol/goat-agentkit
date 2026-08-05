@@ -94,14 +94,21 @@ export function wrapWalletAdapter(
   let activeSessionSigner = config.sessionSigner || new LocalSessionSigner();
   let sessionExpiresAt: number | undefined = config.expiresAt;
 
+  // VD-GOAT-006 fix: Intercept ALL signing methods to prevent policy bypass
   const interceptedMethods = [
     "sendTransaction",
     "signTransaction",
     "transfer",
     "writeContract",
     "signMessage",
+    "signTypedData",        // EIP-712 typed data signing
+    "_signTypedData",       // ethers v6 internal method
     "sendRawTransaction",
     "estimateGas",
+    "sendUserOperation",    // ERC-4337 Account Abstraction
+    "signUserOperation",    // ERC-4337 AA signing
+    "permit",               // ERC-2612 Permit
+    "permit2",              // Uniswap Permit2
   ];
 
   const proxy = new Proxy(underlyingAdapter, {
@@ -121,10 +128,40 @@ export function wrapWalletAdapter(
           }
 
           const txPayload = args[0] || {};
+
+          // VD-GOAT-006 fix: Handle different signing method types
           let recipient = txPayload.to || txPayload.recipient || "0x0000000000000000000000000000000000000000";
           let amount = txPayload.value || txPayload.amount || 0;
           let asset = txPayload.asset || "GOAT";
           const chain = typeof underlyingAdapter.getChainId === "function" ? await underlyingAdapter.getChainId() : 48816;
+
+          // Handle EIP-712 signTypedData - extract value from typed data
+          if (prop === "signTypedData" || prop === "_signTypedData") {
+            const domain = args[0];
+            const types = args[1];
+            const value = args[2];
+
+            // Common EIP-712 patterns: Permit, Permit2, UserOperation
+            if (types.Permit || types.Permit2) {
+              recipient = value.spender || value.to;
+              amount = value.value || value.amount || 0;
+            } else if (types.UserOperation) {
+              recipient = value.sender;
+              amount = value.callGasLimit || 0;
+            }
+          }
+
+          // Handle ERC-4337 UserOperation
+          if (prop === "sendUserOperation" || prop === "signUserOperation") {
+            recipient = txPayload.sender || txPayload.target;
+            amount = txPayload.callGasLimit || 0;
+          }
+
+          // Handle Permit/Permit2
+          if (prop === "permit" || prop === "permit2") {
+            recipient = txPayload.spender;
+            amount = txPayload.value || txPayload.amount;
+          }
 
           if (txPayload.data && txPayload.data !== "0x") {
             try {
@@ -146,8 +183,23 @@ export function wrapWalletAdapter(
             }
           }
 
-          const amountUSD = txPayload.amountUSD;
-          if (amountUSD === undefined && (prop === "sendTransaction" || prop === "signTransaction" || prop === "transfer" || prop === "writeContract" || prop === "sendRawTransaction")) {
+          // VD-GOAT-006 fix: Require amountUSD for all value-bearing operations
+          const VALUE_BEARING_METHODS = [
+            "sendTransaction",
+            "signTransaction",
+            "transfer",
+            "writeContract",
+            "sendRawTransaction",
+            "signTypedData",
+            "_signTypedData",
+            "sendUserOperation",
+            "signUserOperation",
+            "permit",
+            "permit2",
+          ];
+
+          const amountUSD = txPayload.amountUSD || args[3]?.amountUSD; // Check both payload and options
+          if (amountUSD === undefined && VALUE_BEARING_METHODS.includes(prop as string)) {
             throw new Error("[Veridex Wallet Adapter] Cannot determine transaction USD value: amountUSD must be explicitly provided in transaction payload.");
           }
 
