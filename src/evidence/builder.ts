@@ -20,21 +20,55 @@ const EVIDENCE_BUNDLE_TYPES: Record<string, TypedDataField[]> = {
   ],
 };
 
-export function canonicalizeJson(obj: any): string {
+/**
+ * VD-GOAT-013 fix: Add depth and size limits to prevent DoS attacks.
+ */
+const MAX_CANONICALIZE_DEPTH = 10;
+const MAX_CANONICALIZE_SIZE = 100_000; // 100KB
+
+export function canonicalizeJson(obj: any, depth = 0, visited = new WeakSet()): string {
+  // Depth limit check (VD-GOAT-013)
+  if (depth > MAX_CANONICALIZE_DEPTH) {
+    throw new Error(`[Canonicalize Error] Max depth ${MAX_CANONICALIZE_DEPTH} exceeded - possible DoS attack`);
+  }
+
   if (obj === null) return "null";
   if (typeof obj === "bigint") return JSON.stringify(obj.toString());
   if (typeof obj !== "object") return JSON.stringify(obj);
-  if (Array.isArray(obj)) {
-    return "[" + obj.map((item) => canonicalizeJson(item)).join(",") + "]";
+
+  // Circular reference detection (VD-GOAT-013)
+  if (visited.has(obj)) {
+    throw new Error("[Canonicalize Error] Circular reference detected");
   }
+  visited.add(obj);
+
+  if (Array.isArray(obj)) {
+    const result = "[" + obj.map((item) => canonicalizeJson(item, depth + 1, visited)).join(",") + "]";
+
+    // Size limit check (VD-GOAT-013)
+    if (result.length > MAX_CANONICALIZE_SIZE) {
+      throw new Error(`[Canonicalize Error] Result size ${result.length} exceeds ${MAX_CANONICALIZE_SIZE} - possible DoS attack`);
+    }
+
+    return result;
+  }
+
   const keys = Object.keys(obj).sort();
   const parts: string[] = [];
   for (const key of keys) {
     if (obj[key] !== undefined) {
-      parts.push(JSON.stringify(key) + ":" + canonicalizeJson(obj[key]));
+      parts.push(JSON.stringify(key) + ":" + canonicalizeJson(obj[key], depth + 1, visited));
     }
   }
-  return "{" + parts.join(",") + "}";
+
+  const result = "{" + parts.join(",") + "}";
+
+  // Size limit check (VD-GOAT-013)
+  if (result.length > MAX_CANONICALIZE_SIZE) {
+    throw new Error(`[Canonicalize Error] Result size ${result.length} exceeds ${MAX_CANONICALIZE_SIZE} - possible DoS attack`);
+  }
+
+  return result;
 }
 
 export interface EvidenceBundle {
@@ -213,10 +247,31 @@ export class EvidenceBuilder {
   /**
    * Full verification of bundle integrity and signature recovery against session key hash.
    * VD-GOAT-003 fix: Verify EIP-712 signature over complete bundle envelope.
+   * VD-GOAT-013 fix: Add input validation to prevent malformed/malicious bundles.
    */
   public static verifyBundle(bundle: EvidenceBundle): { valid: boolean; recoveredAddress?: string; reason?: string } {
-    if (!bundle || !bundle.signature || !bundle.traceHash) {
-      return { valid: false, reason: "Missing signature or traceHash" };
+    // VD-GOAT-013 fix: Input validation
+    if (!bundle || typeof bundle !== "object") {
+      return { valid: false, reason: "Bundle must be an object" };
+    }
+
+    if (!bundle.signature || typeof bundle.signature !== "string") {
+      return { valid: false, reason: "Missing or invalid signature" };
+    }
+
+    if (!bundle.traceHash || typeof bundle.traceHash !== "string" || !bundle.traceHash.startsWith("0x")) {
+      return { valid: false, reason: "Missing or invalid traceHash" };
+    }
+
+    // Signature length check (65 bytes = 130 hex chars + 0x)
+    if (bundle.signature.length !== 132) {
+      return { valid: false, reason: `Invalid signature length: ${bundle.signature.length}, expected 132` };
+    }
+
+    // Bundle size check
+    const bundleJson = JSON.stringify(bundle);
+    if (bundleJson.length > 1_000_000) { // 1MB limit
+      return { valid: false, reason: `Bundle too large: ${bundleJson.length} bytes exceeds 1MB` };
     }
 
     try {

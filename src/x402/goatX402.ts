@@ -4,6 +4,7 @@ import { PolicyRuleConfig } from "../policy/rules.js";
 import { EvidenceBuilder, EvidenceBundle } from "../evidence/builder.js";
 import { LocalSessionSigner, SessionSigner } from "../evidence/signer.js";
 import { HumanApprovalRequiredError } from "../wrapper.js";
+import { x402RateLimiter } from "../utils/rateLimiter.js";
 
 export interface X402Challenge {
   status: number;
@@ -42,12 +43,31 @@ export interface ActionDefinition {
 /**
  * Parses HTTP 402 responses into standardized GOAT x402 Payment Challenges.
  * VD-GOAT-008 fix: Extracts signature and merchant public key for verification.
+ * VD-GOAT-013 fix: Add rate limiting and input validation.
  */
-export function parseX402Challenge(responseHeaders: Record<string, string>, responseBody?: any): X402Challenge {
+export function parseX402Challenge(responseHeaders: Record<string, string>, responseBody?: any, clientId?: string): X402Challenge {
+  // VD-GOAT-013 fix: Rate limit x402 challenge parsing
+  const rateLimitKey = clientId || "default";
+  if (!x402RateLimiter.check(rateLimitKey)) {
+    throw new Error(
+      `[x402 Rate Limit] Too many challenge requests from ${rateLimitKey}. ` +
+      `Remaining: ${x402RateLimiter.remaining(rateLimitKey)}`
+    );
+  }
   const headerValue = responseHeaders["x-402-payment-required"] || responseHeaders["X-402-Payment-Required"];
   if (headerValue) {
+    // VD-GOAT-013 fix: Validate header size before decoding
+    if (headerValue.length > 10_000) {
+      throw new Error(`[x402 Validation] Challenge header too large: ${headerValue.length} bytes exceeds 10KB`);
+    }
+
     try {
       const decoded = JSON.parse(Buffer.from(headerValue, "base64").toString("utf-8"));
+
+      // VD-GOAT-013 fix: Validate decoded structure
+      if (typeof decoded !== "object" || decoded === null) {
+        throw new Error("[x402 Validation] Challenge must be an object");
+      }
       const amountUSD = decoded.amountUSD;
       if (amountUSD === undefined) {
         throw new Error("[Veridex x402 Challenge] Cannot determine payment USD value: amountUSD is missing from the challenge data.");
