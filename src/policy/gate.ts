@@ -5,29 +5,39 @@ import { safeStringify } from "../utils/serialize.js";
 import { NormalizedAction } from "../types/action.js";
 import * as fs from "fs";
 import * as path from "path";
+import { SignedStateFile } from "../utils/atomicFile.js";
 
 export interface PolicyStateProvider {
   loadState(): { txTimestamps: number[]; dailySpendUSD: number; lastSpendResetDay: number; lastTxTimestamp: number; isCircuitBreakerTripped: boolean };
   saveState(state: { txTimestamps: number[]; dailySpendUSD: number; lastSpendResetDay: number; lastTxTimestamp: number; isCircuitBreakerTripped: boolean }): void;
 }
 
+/**
+ * VD-GOAT-011 fix: File-based policy state with atomic writes and integrity protection.
+ */
 export class FilePolicyStateProvider implements PolicyStateProvider {
-  private filePath: string;
+  private stateFile: SignedStateFile<{
+    txTimestamps: number[];
+    dailySpendUSD: number;
+    lastSpendResetDay: number;
+    lastTxTimestamp: number;
+    isCircuitBreakerTripped: boolean;
+  }>;
   private saveTimeout: NodeJS.Timeout | null = null;
 
-  constructor(filePath: string = "veridex-policy-state.json") {
-    this.filePath = path.resolve(filePath);
+  constructor(filePath: string = "veridex-policy-state.json", secret?: string) {
+    this.stateFile = new SignedStateFile(path.resolve(filePath), secret);
   }
 
   public loadState() {
-    try {
-      if (fs.existsSync(this.filePath)) {
-        const data = fs.readFileSync(this.filePath, "utf-8");
-        return JSON.parse(data);
-      }
-    } catch (e) {
-      // Fallback
+    // VD-GOAT-011 fix: Use signed state file with HMAC verification
+    const state = this.stateFile.read();
+
+    if (state) {
+      return state;
     }
+
+    // Default state if file doesn't exist or verification fails
     return {
       txTimestamps: [],
       dailySpendUSD: 0,
@@ -38,21 +48,34 @@ export class FilePolicyStateProvider implements PolicyStateProvider {
   }
 
   public saveState(state: any): void {
+    // VD-GOAT-011 fix: Circuit breaker writes immediately with atomic fsync
     if (state.isCircuitBreakerTripped) {
       try {
-        fs.writeFileSync(this.filePath, safeStringify(state, 2), "utf-8");
-      } catch {}
+        this.stateFile.write(state);
+      } catch (error: any) {
+        console.error(`[Policy State] Failed to save circuit breaker state: ${error.message}`);
+        // In production with STRICT mode, this should alert/page
+        if (process.env.STRICT_STATE_PERSISTENCE === "true") {
+          throw error;
+        }
+      }
       return;
     }
 
+    // Debounce normal writes
     if (this.saveTimeout) {
       clearTimeout(this.saveTimeout);
     }
 
     this.saveTimeout = setTimeout(() => {
       try {
-        fs.promises.writeFile(this.filePath, safeStringify(state, 2), "utf-8").catch(() => {});
-      } catch {}
+        this.stateFile.write(state);
+      } catch (error: any) {
+        console.error(`[Policy State] Failed to save state: ${error.message}`);
+        if (process.env.STRICT_STATE_PERSISTENCE === "true") {
+          throw error;
+        }
+      }
     }, 50);
   }
 }
