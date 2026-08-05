@@ -166,8 +166,16 @@ export function wrapWalletAdapter(
               metadata: { method: prop, txPayload },
             });
 
+            // 1b. Atomic Budget Reservation (VD-GOAT-005 fix)
+            const actionId = ethers.id(`${chain}:${recipient}:${amount}:${Date.now()}`);
+            const reservationSuccess = policyGate.reserve(actionId, amountUSD);
+            if (!reservationSuccess) {
+              throw new Error(`[Veridex Policy Denial] Budget reservation failed: would exceed daily limit`);
+            }
+
             // 2. Pre-Signature Enforcement Gate: Denial
             if (evaluation.verdict === "deny") {
+              policyGate.releaseReservation(actionId);
               const denialBundle = evidenceBuilder.buildDenial({
                 payload: { to: recipient, amount, asset, chain },
                 evaluation,
@@ -181,6 +189,7 @@ export function wrapWalletAdapter(
 
             // 2b. Pre-Signature Enforcement Gate: Escalation
             if (evaluation.verdict === "escalate") {
+              policyGate.releaseReservation(actionId);
               const escalationBundle = evidenceBuilder.buildDenial({
                 payload: { to: recipient, amount, asset, chain },
                 evaluation,
@@ -211,8 +220,8 @@ export function wrapWalletAdapter(
 
             const txHash = typeof result === "string" ? result : result?.hash;
             if (txHash) {
-              // Commit policy limits now that transaction has successfully broadcasted
-              policyGate.commit(amountUSD, evaluation.evaluatedAt);
+              // Commit policy limits now that transaction has successfully broadcasted (VD-GOAT-005 fix)
+              policyGate.commit(amountUSD, evaluation.evaluatedAt, actionId);
 
               // 5. Build & Sign Complete Evidence Bundle
               const bundle = evidenceBuilder.buildSuccess({
