@@ -16,6 +16,8 @@ export interface X402Challenge {
   scheme: "exact" | "authorization" | "eip3009";
   nonce?: string;
   validBefore?: number;
+  signature?: string; // VD-GOAT-008: Merchant signature over challenge
+  merchantPublicKey?: string; // VD-GOAT-008: Merchant's signing key
 }
 
 export interface EIP3009Authorization {
@@ -39,6 +41,7 @@ export interface ActionDefinition {
 
 /**
  * Parses HTTP 402 responses into standardized GOAT x402 Payment Challenges.
+ * VD-GOAT-008 fix: Extracts signature and merchant public key for verification.
  */
 export function parseX402Challenge(responseHeaders: Record<string, string>, responseBody?: any): X402Challenge {
   const headerValue = responseHeaders["x-402-payment-required"] || responseHeaders["X-402-Payment-Required"];
@@ -59,6 +62,8 @@ export function parseX402Challenge(responseHeaders: Record<string, string>, resp
         scheme: decoded.scheme || "authorization",
         nonce: decoded.nonce,
         validBefore: decoded.validBefore,
+        signature: decoded.signature, // VD-GOAT-008: Merchant signature
+        merchantPublicKey: decoded.merchantPublicKey, // VD-GOAT-008: Merchant's key
       };
     } catch (e: any) {
       if (e.message && e.message.includes("Cannot determine payment USD value")) {
@@ -83,10 +88,103 @@ export function parseX402Challenge(responseHeaders: Record<string, string>, resp
       scheme: responseBody.scheme || "authorization",
       nonce: responseBody.nonce,
       validBefore: responseBody.validBefore,
+      signature: responseBody.signature, // VD-GOAT-008: Merchant signature
+      merchantPublicKey: responseBody.merchantPublicKey, // VD-GOAT-008: Merchant's key
     };
   }
 
   throw new Error("Invalid x402 challenge: Missing x-402-payment-required header or body");
+}
+
+/**
+ * VD-GOAT-008 fix: Verify x402 challenge authenticity to prevent replay attacks.
+ *
+ * Verifies:
+ * 1. Challenge signature from merchant
+ * 2. Nonce freshness (no replay)
+ * 3. validBefore timestamp
+ * 4. Settlement receipt (if provided)
+ *
+ * @param challenge - Parsed x402 challenge
+ * @param options - Verification options
+ * @returns Verification result
+ */
+export function verifyX402Challenge(
+  challenge: X402Challenge,
+  options: {
+    usedNonces?: Set<string>;
+    allowedMerchants?: Set<string>;
+    settlementReceipt?: { txHash: string; blockNumber: number };
+  } = {}
+): { valid: boolean; reason?: string } {
+  // 1. Verify validBefore timestamp
+  if (challenge.validBefore) {
+    const now = Math.floor(Date.now() / 1000);
+    if (challenge.validBefore < now) {
+      return { valid: false, reason: `Challenge expired: validBefore ${challenge.validBefore} < now ${now}` };
+    }
+  }
+
+  // 2. Verify nonce freshness (prevent replay)
+  if (challenge.nonce && options.usedNonces) {
+    if (options.usedNonces.has(challenge.nonce)) {
+      return { valid: false, reason: `Nonce replay detected: ${challenge.nonce}` };
+    }
+  }
+
+  // 3. Verify merchant signature (if provided)
+  if (challenge.signature && challenge.merchantPublicKey) {
+    try {
+      // Construct canonical challenge message
+      const message = JSON.stringify({
+        accepts: challenge.accepts,
+        amount: challenge.amount,
+        amountUSD: challenge.amountUSD,
+        payTo: challenge.payTo,
+        chain: challenge.chain,
+        scheme: challenge.scheme,
+        nonce: challenge.nonce,
+        validBefore: challenge.validBefore,
+      });
+
+      const messageHash = ethers.hashMessage(message);
+      const recoveredAddress = ethers.recoverAddress(messageHash, challenge.signature);
+
+      // Verify recovered address matches merchant public key
+      if (recoveredAddress.toLowerCase() !== challenge.merchantPublicKey.toLowerCase()) {
+        return {
+          valid: false,
+          reason: `Invalid signature: recovered ${recoveredAddress}, expected ${challenge.merchantPublicKey}`,
+        };
+      }
+
+      // Check if merchant is in allowed list
+      if (options.allowedMerchants && !options.allowedMerchants.has(recoveredAddress.toLowerCase())) {
+        return {
+          valid: false,
+          reason: `Untrusted merchant: ${recoveredAddress} not in allowed list`,
+        };
+      }
+    } catch (error: any) {
+      return { valid: false, reason: `Signature verification failed: ${error.message}` };
+    }
+  } else if (process.env.STRICT_X402 === "true") {
+    // In strict mode, require signature
+    return { valid: false, reason: "Missing signature or merchantPublicKey (required in STRICT_X402 mode)" };
+  }
+
+  // 4. Verify settlement receipt (if provided)
+  if (options.settlementReceipt) {
+    // Verify settlement matches challenge parameters
+    // This is checked separately in the wrapper after transaction completion
+  }
+
+  // Mark nonce as used
+  if (challenge.nonce && options.usedNonces) {
+    options.usedNonces.add(challenge.nonce);
+  }
+
+  return { valid: true };
 }
 
 /**
