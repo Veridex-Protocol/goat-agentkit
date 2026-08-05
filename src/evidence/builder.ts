@@ -1,5 +1,24 @@
-import { keccak256, toUtf8Bytes, recoverAddress, getBytes, hashMessage, ethers } from "ethers";
+import { keccak256, toUtf8Bytes, recoverAddress, getBytes, hashMessage, ethers, verifyTypedData, TypedDataDomain, TypedDataField } from "ethers";
 import { PolicyEvaluation, PaymentContext } from "../policy/rules.js";
+
+// EIP-712 domain for evidence bundle signatures (VD-GOAT-003 fix)
+const EVIDENCE_BUNDLE_DOMAIN: TypedDataDomain = {
+  name: "Veridex Evidence Bundle",
+  version: "1",
+  chainId: 48816,
+};
+
+const EVIDENCE_BUNDLE_TYPES: Record<string, TypedDataField[]> = {
+  EvidenceBundle: [
+    { name: "traceHash", type: "bytes32" },
+    { name: "bundleHash", type: "bytes32" },
+    { name: "agentId", type: "string" },
+    { name: "sessionKeyHash", type: "bytes32" },
+    { name: "settlementTxHash", type: "bytes32" },
+    { name: "storageContentId", type: "string" },
+    { name: "assembledAt", type: "uint256" },
+  ],
+};
 
 export function canonicalizeJson(obj: any): string {
   if (obj === null) return "null";
@@ -193,6 +212,7 @@ export class EvidenceBuilder {
 
   /**
    * Full verification of bundle integrity and signature recovery against session key hash.
+   * VD-GOAT-003 fix: Verify EIP-712 signature over complete bundle envelope.
    */
   public static verifyBundle(bundle: EvidenceBundle): { valid: boolean; recoveredAddress?: string; reason?: string } {
     if (!bundle || !bundle.signature || !bundle.traceHash) {
@@ -200,19 +220,44 @@ export class EvidenceBuilder {
     }
 
     try {
-      const recoveredAddress = recoverAddress(hashMessage(getBytes(bundle.traceHash)), bundle.signature);
+      // 1. Verify trace hash integrity
       const canonicalTrace = canonicalizeJson(bundle.trace);
       const computedHash = keccak256(toUtf8Bytes(canonicalTrace));
-
       const hashValid = computedHash.toLowerCase() === bundle.traceHash.toLowerCase();
       if (!hashValid) {
-        return { valid: false, recoveredAddress, reason: "Trace hash mismatch" };
+        return { valid: false, reason: "Trace hash mismatch" };
       }
 
-      if (bundle.bundleHash) {
-        const copy = { ...bundle, signature: undefined };
-        delete (copy as any).signature;
+      // 2. VD-GOAT-003 fix: Recover signer from EIP-712 signature over complete bundle
+      const value = {
+        traceHash: bundle.traceHash,
+        bundleHash: bundle.bundleHash || bundle.traceHash,
+        agentId: bundle.trace?.agentId || "",
+        sessionKeyHash: bundle.trace?.sessionKeyHash || "0x0000000000000000000000000000000000000000000000000000000000000000",
+        settlementTxHash: bundle.settlementProof?.txHash || "0x0000000000000000000000000000000000000000000000000000000000000000",
+        storageContentId: bundle.storageReceipt?.contentId || "",
+        assembledAt: bundle.assembledAt || 0,
+      };
 
+      const recoveredAddress = verifyTypedData(
+        EVIDENCE_BUNDLE_DOMAIN,
+        EVIDENCE_BUNDLE_TYPES,
+        value,
+        bundle.signature
+      );
+
+      // 3. Verify recovered signer matches declared sessionKeyHash
+      if (bundle.trace?.sessionKeyHash) {
+        const expectedHash = ethers.id(recoveredAddress).toLowerCase();
+        const rawAddr = recoveredAddress.toLowerCase();
+        const givenHash = bundle.trace.sessionKeyHash.toLowerCase();
+        if (givenHash !== expectedHash && givenHash !== rawAddr) {
+          return { valid: false, recoveredAddress, reason: "Signer address does not match trace sessionKeyHash" };
+        }
+      }
+
+      // 4. Verify bundleHash integrity if present
+      if (bundle.bundleHash) {
         const copyBundle = {
           trace: bundle.trace,
           traceHash: bundle.traceHash,
@@ -225,15 +270,6 @@ export class EvidenceBuilder {
 
         if (computedBundleHash.toLowerCase() !== bundle.bundleHash.toLowerCase()) {
           return { valid: false, recoveredAddress, reason: "Bundle payload mutation detected" };
-        }
-      }
-
-      if (bundle.trace?.sessionKeyHash) {
-        const expectedHash = ethers.id(recoveredAddress).toLowerCase();
-        const rawAddr = recoveredAddress.toLowerCase();
-        const givenHash = bundle.trace.sessionKeyHash.toLowerCase();
-        if (givenHash !== expectedHash && givenHash !== rawAddr) {
-          return { valid: false, recoveredAddress, reason: "Signer address does not match trace sessionKeyHash" };
         }
       }
 
