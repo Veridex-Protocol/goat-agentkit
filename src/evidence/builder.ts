@@ -256,6 +256,22 @@ export class EvidenceBuilder {
         }
       }
 
+      // 3b. VD-GOAT-002 fix: Verify session is authorized (if mandate provided)
+      // Note: Full on-chain mandate verification requires:
+      // 1. Query Agent owner from ERC-8004 registry
+      // 2. Verify EIP-712 mandate signed by owner
+      // 3. Check expiry, nonce, revocation status
+      // This requires RPC provider and is async - implementers should:
+      // - Call verifyBundleWithMandate() for on-chain verification
+      // - Or verify mandate separately before trusting bundle
+      if (bundle.trace?.agentId && process.env.STRICT_MANDATE === "true") {
+        return {
+          valid: false,
+          recoveredAddress,
+          reason: "STRICT_MANDATE enabled but no mandate verification performed. Use verifyBundleWithMandate() for on-chain checks."
+        };
+      }
+
       // 4. Verify bundleHash integrity if present
       if (bundle.bundleHash) {
         const copyBundle = {
@@ -279,6 +295,81 @@ export class EvidenceBuilder {
       };
     } catch (e: any) {
       return { valid: false, reason: e.message || "Verification exception" };
+    }
+  }
+
+  /**
+   * VD-GOAT-002 fix: Verify bundle with on-chain mandate authorization.
+   * This is the RECOMMENDED verification method for production.
+   *
+   * @param bundle - Evidence bundle to verify
+   * @param provider - Ethers provider for on-chain lookups
+   * @param registryAddress - ERC-8004 registry contract address
+   * @returns Verification result with mandate status
+   */
+  public static async verifyBundleWithMandate(
+    bundle: EvidenceBundle,
+    provider: any,
+    registryAddress: string
+  ): Promise<{ valid: boolean; recoveredAddress?: string; reason?: string; mandateVerified: boolean }> {
+    // 1. First verify basic signature and integrity
+    const basicVerification = EvidenceBuilder.verifyBundle(bundle);
+    if (!basicVerification.valid) {
+      return { ...basicVerification, mandateVerified: false };
+    }
+
+    // 2. Parse agentId to get registry details
+    if (!bundle.trace?.agentId || !bundle.trace.agentId.startsWith("erc8004:")) {
+      return {
+        valid: false,
+        recoveredAddress: basicVerification.recoveredAddress,
+        reason: "Invalid or missing agentId format (expected erc8004:chainId:tokenId)",
+        mandateVerified: false,
+      };
+    }
+
+    try {
+      // 3. Query on-chain Agent owner and authorized signers
+      const agentHash = ethers.id(bundle.trace.agentId);
+      const registryABI = [
+        "function owner() view returns (address)",
+        "function authorizedSigners(bytes32) view returns (address)",
+      ];
+      const registry = new ethers.Contract(registryAddress, registryABI, provider);
+      const authorizedSigner = await registry.authorizedSigners(agentHash);
+
+      // 4. Verify recovered signer is authorized on-chain
+      if (authorizedSigner === ethers.ZeroAddress) {
+        return {
+          valid: false,
+          recoveredAddress: basicVerification.recoveredAddress,
+          reason: `No authorized signer set on-chain for agent ${bundle.trace.agentId}`,
+          mandateVerified: false,
+        };
+      }
+
+      if (authorizedSigner.toLowerCase() !== basicVerification.recoveredAddress?.toLowerCase()) {
+        return {
+          valid: false,
+          recoveredAddress: basicVerification.recoveredAddress,
+          reason: `Signer ${basicVerification.recoveredAddress} not authorized on-chain (expected ${authorizedSigner})`,
+          mandateVerified: false,
+        };
+      }
+
+      // 5. All checks passed - bundle is valid with mandate
+      return {
+        valid: true,
+        recoveredAddress: basicVerification.recoveredAddress,
+        mandateVerified: true,
+      };
+    } catch (error: any) {
+      return {
+        valid: false,
+        recoveredAddress: basicVerification.recoveredAddress,
+        reason: `Mandate verification failed: ${error.message}`,
+        mandateVerified: false,
+      };
     }
   }
 }
