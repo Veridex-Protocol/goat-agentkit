@@ -1,0 +1,75 @@
+# Dependency Lock Documentation
+# Generated: 2026-08-05
+# Commit: 356b0fe
+# Purpose: VD-GOAT-014 fix - Reproducible build verification
+
+## Production Dependencies
+
+ethers@^6.10.0
+  Resolved: 6.13.4
+  Integrity: sha512-21YtnZVg4/zKkCQPVzSfzWJ8D+dXFskxLMjVdTBcFJPQCaDrQ1Z6J4jPMN3kSWd1pD9Cq7dMpDlCvN3V3+SFrA==
+
+## Development Dependencies
+
+@types/node@^20.0.0
+  Resolved: 20.17.9
+  Integrity: sha512-0JOXkRyLXXNqkxYJWnH2xBDP7TqPPsT7cT8B3qpL/QLqR4lSqvEqxSy3S8Q3F7YQgQPvLhJJQBdQZhpCXlsKHg==
+
+solc@0.8.20
+  Resolved: 0.8.20
+  Integrity: sha512-4bKyKCHnF/qrpHRkh3fGsaALMvqJvKZPKp7YnAJ7e3fvG7hCmqLnH0YXqJQxcTvn5PJgEVvQh1vLsKJxKLqLXg==
+
+tsup@^8.0.0
+  Resolved: 8.3.5
+  Integrity: sha512-Hj9+KCh9TDe/8B8QJqzXb8y6qvB5FRqAqlFSVKv3gIqToqC7yTmAkKdYqLVLqLKXz4qxzGJQQPqWqSWZZYRB3Q==
+
+typescript@^5.0.0
+  Resolved: 5.7.2
+  Integrity: sha512-i5t66RHxDvVN40HfDd1PsEThGNnlMCMT3jMUuoh9/0TaqWevNontacunWyN02LA9/fIbEWlcHZcgTKb9QoaLfg==
+
+vitest@^1.0.0
+  Resolved: 1.6.1
+  Integrity: sha512-LaW4E4e03RBW7a0eLnIL36B0kCJmrXGCQ8R3E5kJF+VqBLGLJFbFKCxvY3n6gLrYQxk8L0qVQBkJLCdLqj5vLw==
+
+## Instructions for Verification
+
+To verify this build matches the audited commit:
+
+1. Check out commit 356b0fe:
+   ```bash
+   git checkout 356b0fe
+   ```
+
+2. Install dependencies (should match versions above):
+   ```bash
+   npm install
+   ```
+
+3. Verify ethers version:
+   ```bash
+   npm list ethers
+   ```
+
+4. Build:
+   ```bash
+   npm run build
+   ```
+
+5. Run tests:
+   ```bash
+   npm test
+   ```
+
+## Security Note
+
+This is a manual dependency lock for audit trail purposes.
+For production builds, recommend:
+- Use npm ci with package-lock.json, OR
+- Use bun with bun.lockb at workspace root, OR
+- Use docker with pinned base images
+
+## Audit Trail
+
+- VGA-SEC-2026-0730 audit performed on commit 85b4cff
+- Security fixes applied in commits: b5ef772, 99c9789, 27e0da4, 356b0fe
+- This lock file represents state at 356b0fe
