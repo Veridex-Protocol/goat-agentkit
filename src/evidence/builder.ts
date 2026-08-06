@@ -45,6 +45,9 @@ export function canonicalizeJson(obj: any, depth = 0, visited = new WeakSet()): 
   if (Array.isArray(obj)) {
     const result = "[" + obj.map((item) => canonicalizeJson(item, depth + 1, visited)).join(",") + "]";
 
+    // Remove from visited after processing (allows shared references, only blocks true cycles)
+    visited.delete(obj);
+
     // Size limit check (VD-GOAT-013)
     if (result.length > MAX_CANONICALIZE_SIZE) {
       throw new Error(`[Canonicalize Error] Result size ${result.length} exceeds ${MAX_CANONICALIZE_SIZE} - possible DoS attack`);
@@ -60,6 +63,9 @@ export function canonicalizeJson(obj: any, depth = 0, visited = new WeakSet()): 
       parts.push(JSON.stringify(key) + ":" + canonicalizeJson(obj[key], depth + 1, visited));
     }
   }
+
+  // Remove from visited after processing (allows shared references, only blocks true cycles)
+  visited.delete(obj);
 
   const result = "{" + parts.join(",") + "}";
 
