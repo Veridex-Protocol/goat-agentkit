@@ -35,10 +35,13 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
-    "ethers": "^6.10.0"
+    "ethers": "^6.10.0",
+    "pg": "^8.20.0",
+    "zod": "^3.22.4"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
+    "@types/pg": "^8.11.0",
     "solc": "0.8.20",
     "tsup": "^8.0.0",
     "typescript": "^5.0.0",

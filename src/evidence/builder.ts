@@ -194,6 +194,10 @@ export class EvidenceBuilder {
     runtime?: string;
     storageCid?: string;
   }): EvidenceBundle {
+    const teeVerified = params.teeAttestation?.verified === true;
+    if (process.env.NODE_ENV === "production" && params.teeAttestation && !teeVerified) {
+      throw new Error("Refusing to label or emit production evidence with an unverified TEE attestation");
+    }
     const timestamp = Date.now();
     const traceId = params.traceId || crypto.randomUUID();
 
@@ -212,7 +216,7 @@ export class EvidenceBuilder {
       },
       policyEvaluation: params.evaluation,
       environment: {
-        runtime: params.runtime || (params.teeAttestation ? "azure-sev-snp-tee" : "node-runtime"),
+        runtime: params.runtime || (teeVerified ? "verified-tee" : params.teeAttestation ? "unverified-attestation" : "node-runtime"),
         teeAttestation: params.teeAttestation,
       },
     };
@@ -390,30 +394,30 @@ export class EvidenceBuilder {
     }
 
     try {
-      // 3. Query on-chain Agent owner and authorized signers
+      // 3. Query the v2 registry's evidence-authority allowlist. The anchoring
+      // relayer is deliberately a different role and must never be mistaken
+      // for the signer that authorized this bundle.
       const agentHash = ethers.id(bundle.trace.agentId);
       const registryABI = [
-        "function owner() view returns (address)",
-        "function authorizedSigners(bytes32) view returns (address)",
+        "function authorizedEvidenceSigners(bytes32,address) view returns (bool)",
       ];
       const registry = new ethers.Contract(registryAddress, registryABI, provider);
-      const authorizedSigner = await registry.authorizedSigners(agentHash);
-
-      // 4. Verify recovered signer is authorized on-chain
-      if (authorizedSigner === ethers.ZeroAddress) {
+      const recoveredSigner = basicVerification.recoveredAddress;
+      if (!recoveredSigner) {
         return {
           valid: false,
-          recoveredAddress: basicVerification.recoveredAddress,
-          reason: `No authorized signer set on-chain for agent ${bundle.trace.agentId}`,
+          reason: "Evidence bundle has no recoverable session signer",
           mandateVerified: false,
         };
       }
+      const authorized = await registry.authorizedEvidenceSigners(agentHash, recoveredSigner);
 
-      if (authorizedSigner.toLowerCase() !== basicVerification.recoveredAddress?.toLowerCase()) {
+      // 4. Verify recovered signer is authorized on-chain
+      if (!authorized) {
         return {
           valid: false,
-          recoveredAddress: basicVerification.recoveredAddress,
-          reason: `Signer ${basicVerification.recoveredAddress} not authorized on-chain (expected ${authorizedSigner})`,
+          recoveredAddress: recoveredSigner,
+          reason: `Signer ${recoveredSigner} is not an authorized evidence signer for agent ${bundle.trace.agentId}`,
           mandateVerified: false,
         };
       }

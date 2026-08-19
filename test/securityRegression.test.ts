@@ -15,8 +15,10 @@ import {
   parseX402Challenge,
   EvidenceBuilder,
   LocalSessionSigner,
+  TransactionDecoder,
+  registerAsset,
 } from "../src/index";
-import { verifyX402Challenge } from "../src/x402/goatX402";
+import { InMemoryX402NonceStore, verifyX402Challenge } from "../src/x402/goatX402";
 import { SessionRevocationList } from "../src/session/revocation";
 import { RateLimiter } from "../src/utils/rateLimiter";
 import { canonicalizeJson } from "../src/evidence/builder";
@@ -111,6 +113,32 @@ describe("VD-GOAT-001: Negative amount validation", () => {
       amountUSD: 10,
     });
     expect(["allow", "pass"]).toContain(result.verdict);
+  });
+});
+
+describe("VRD-2026-001: normalized action semantic binding", () => {
+  const chainId = 90123;
+  const token = "0x1111111111111111111111111111111111111111";
+  const recipient = "0x2222222222222222222222222222222222222222";
+  const from = "0x3333333333333333333333333333333333333333";
+
+  beforeEach(() => {
+    registerAsset(chainId, { symbol: "USDC", decimals: 6, priceUSD: 1, native: false, tokenAddress: token });
+  });
+
+  it("rejects approval calldata instead of re-encoding it as a transfer", () => {
+    const data = new ethers.Interface(["function approve(address,uint256)"])
+      .encodeFunctionData("approve", [recipient, 2500000n]);
+    expect(() => TransactionDecoder.decodeAndNormalize({ from, to: token, data, asset: "USDC", chainId }))
+      .toThrow("refusing to reinterpret calldata");
+  });
+
+  it("rejects ERC-20 calldata sent to a contract other than the registered asset", () => {
+    const data = new ethers.Interface(["function transfer(address,uint256)"])
+      .encodeFunctionData("transfer", [recipient, 2500000n]);
+    expect(() => TransactionDecoder.decodeAndNormalize({
+      from, to: "0x4444444444444444444444444444444444444444", data, asset: "USDC", chainId,
+    })).toThrow("does not match allowlisted");
   });
 });
 
@@ -419,7 +447,7 @@ describe("VD-GOAT-007: TEE JWT verification", () => {
 // ─── VD-GOAT-008: x402 Challenge Authentication ─────────────────────────────
 
 describe("VD-GOAT-008: x402 challenge verification", () => {
-  it("should reject expired challenge", () => {
+  it("should reject expired challenge", async () => {
     const challenge = {
       status: 402,
       accepts: "USDC",
@@ -432,12 +460,12 @@ describe("VD-GOAT-008: x402 challenge verification", () => {
       validBefore: Math.floor(Date.now() / 1000) - 3600, // expired
     };
 
-    const result = verifyX402Challenge(challenge);
+    const result = await verifyX402Challenge(challenge, {});
     expect(result.valid).toBe(false);
-    expect(result.reason).toContain("expired");
+    expect(result.reason).toContain("future validBefore");
   });
 
-  it("should reject nonce replay", () => {
+  it("should reject nonce replay", async () => {
     const usedNonces = new Set(["nonce123"]);
 
     const challenge = {
@@ -452,13 +480,14 @@ describe("VD-GOAT-008: x402 challenge verification", () => {
       validBefore: Math.floor(Date.now() / 1000) + 3600,
     };
 
-    const result = verifyX402Challenge(challenge, { usedNonces });
+    const result = await verifyX402Challenge(challenge, { usedNonces });
     expect(result.valid).toBe(false);
-    expect(result.reason).toContain("replay");
+    expect(result.reason).toContain("merchant signature");
   });
 
-  it("should accept valid challenge and track nonce", () => {
-    const usedNonces = new Set<string>();
+  it("should accept a signed allowlisted challenge once and track its nonce", async () => {
+    const merchant = ethers.Wallet.createRandom();
+    const nonceStore = new InMemoryX402NonceStore();
 
     const challenge = {
       status: 402,
@@ -470,17 +499,54 @@ describe("VD-GOAT-008: x402 challenge verification", () => {
       scheme: "authorization" as const,
       nonce: "fresh-nonce-456",
       validBefore: Math.floor(Date.now() / 1000) + 3600,
+      merchantPublicKey: merchant.address,
+      signature: undefined as string | undefined,
     };
+    const message = JSON.stringify({ ...challenge, status: undefined, merchantPublicKey: undefined, signature: undefined });
+    challenge.signature = await merchant.signMessage(message);
 
-    const result = verifyX402Challenge(challenge, { usedNonces });
+    const result = await verifyX402Challenge(challenge, {
+      nonceStore,
+      allowedMerchants: new Set([merchant.address.toLowerCase()]),
+    });
     expect(result.valid).toBe(true);
-    expect(usedNonces.has("fresh-nonce-456")).toBe(true);
+    expect((await verifyX402Challenge(challenge, { nonceStore, allowedMerchants: new Set([merchant.address.toLowerCase()]) })).reason).toContain("replay");
   });
 });
 
 // ─── VD-GOAT-009: Registry Authorization ─────────────────────────────────────
 
 describe("VD-GOAT-009: Registry authorization", () => {
+  it("binds an evidence authorization to the v2 registry, session signer, and deadline", async () => {
+    const signer = new LocalSessionSigner("0x" + "c".repeat(64));
+    const sessionSigner = await signer.getAddress();
+    const verifyingContract = "0x1111111111111111111111111111111111111111";
+    const deadline = Math.floor(Date.now() / 1000) + 300;
+    const bundleHash = ethers.id("bundle-v2-authorization");
+    const signature = await signer.signEvidenceAuthorization({
+      agentId: "erc8004:48816:1042",
+      bundleHash,
+      sessionSigner,
+      deadline,
+      chainId: 48816,
+      verifyingContract,
+    });
+    const recovered = ethers.verifyTypedData(
+      { name: "Veridex Evidence Registry", version: "2", chainId: 48816, verifyingContract },
+      {
+        EvidenceAuthorization: [
+          { name: "agentHash", type: "bytes32" },
+          { name: "bundleHash", type: "bytes32" },
+          { name: "sessionSigner", type: "address" },
+          { name: "deadline", type: "uint256" },
+        ],
+      },
+      { agentHash: ethers.id("erc8004:48816:1042"), bundleHash, sessionSigner, deadline },
+      signature,
+    );
+    expect(recovered).toBe(sessionSigner);
+  });
+
   it("should export registry initialization function via demo server", () => {
     // This is validated by the demo server's initializeRegistryAuthorization()
     // The test verifies the ERC-8004 client has setAuthorizedSigner in its ABI
@@ -576,6 +642,22 @@ describe("VD-GOAT-012: Session revocation enforcement", () => {
     // Second instance should see revocation
     const list2 = new SessionRevocationList(testFile, secret);
     expect(list2.isRevoked(sessionAddr)).toBe(true);
+  });
+
+  it("fails closed on an asynchronous durable revocation backend", async () => {
+    const durableRevocations = {
+      revoke: vi.fn().mockResolvedValue(undefined),
+      isRevoked: vi.fn().mockResolvedValue(true),
+    };
+    const wrapped = wrapWalletAdapter(createMockWallet(), createTestConfig({
+      sessionRevocationProvider: durableRevocations,
+    }));
+
+    await expect(wrapped.sendTransaction({})).rejects.toThrow("has been revoked");
+    expect(durableRevocations.isRevoked).toHaveBeenCalledWith(
+      await createTestConfig().sessionSigner.getAddress(),
+      "erc8004:48816:1042",
+    );
   });
 
   it("should clean up old revocations", () => {

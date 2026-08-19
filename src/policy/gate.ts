@@ -7,76 +7,113 @@ import * as fs from "fs";
 import * as path from "path";
 import { SignedStateFile } from "../utils/atomicFile.js";
 
+export interface PolicyState {
+  txTimestamps: number[];
+  dailySpendUSD: number;
+  lastSpendResetDay: number;
+  lastTxTimestamp: number;
+  isCircuitBreakerTripped: boolean;
+  // VRD-2026-007 fix: durable reservations + processed idempotency keys
+  reservations: Record<string, number>;
+  processedActionIds: string[];
+}
+
 export interface PolicyStateProvider {
-  loadState(): { txTimestamps: number[]; dailySpendUSD: number; lastSpendResetDay: number; lastTxTimestamp: number; isCircuitBreakerTripped: boolean };
-  saveState(state: { txTimestamps: number[]; dailySpendUSD: number; lastSpendResetDay: number; lastTxTimestamp: number; isCircuitBreakerTripped: boolean }): void;
+  loadState(): PolicyState | Promise<PolicyState>;
+  saveState(state: PolicyState): void | Promise<void>;
+}
+
+/**
+ * A shared provider can execute a mutation while holding a database row lock.
+ * This is deliberately a separate interface: a file is durable but cannot make
+ * a daily-cap reservation atomic across replicas.
+ */
+export interface TransactionalPolicyStateProvider extends PolicyStateProvider {
+  transact<T>(mutate: (state: PolicyState) => { state: PolicyState; result: T }): Promise<T>;
+}
+
+export function createDefaultPolicyState(): PolicyState {
+  return {
+    txTimestamps: [],
+    dailySpendUSD: 0,
+    lastSpendResetDay: Math.floor(Date.now() / 86400000),
+    lastTxTimestamp: 0,
+    isCircuitBreakerTripped: false,
+    reservations: {},
+    processedActionIds: [],
+  };
+}
+
+export function sanitizePolicyState(value: Partial<PolicyState> | undefined): PolicyState {
+  const fallback = createDefaultPolicyState();
+  if (!value || typeof value !== "object") return fallback;
+  const dailySpendUSD = value.dailySpendUSD;
+  const lastSpendResetDay = value.lastSpendResetDay;
+  const lastTxTimestamp = value.lastTxTimestamp;
+  return {
+    txTimestamps: Array.isArray(value.txTimestamps) ? value.txTimestamps.filter(Number.isFinite).slice(-10_000) : [],
+    dailySpendUSD: Number.isFinite(dailySpendUSD) && (dailySpendUSD as number) >= 0 ? dailySpendUSD as number : 0,
+    lastSpendResetDay: Number.isSafeInteger(lastSpendResetDay) ? lastSpendResetDay as number : fallback.lastSpendResetDay,
+    lastTxTimestamp: Number.isFinite(lastTxTimestamp) && (lastTxTimestamp as number) >= 0 ? lastTxTimestamp as number : 0,
+    isCircuitBreakerTripped: value.isCircuitBreakerTripped === true,
+    reservations: value.reservations && typeof value.reservations === "object"
+      ? Object.fromEntries(Object.entries(value.reservations).filter(([key, amount]) => key.length <= 256 && Number.isFinite(amount) && amount >= 0))
+      : {},
+    processedActionIds: Array.isArray(value.processedActionIds)
+      ? value.processedActionIds.filter((id): id is string => typeof id === "string" && id.length > 0 && id.length <= 256).slice(-10_000)
+      : [],
+  };
 }
 
 /**
  * VD-GOAT-011 fix: File-based policy state with atomic writes and integrity protection.
  */
 export class FilePolicyStateProvider implements PolicyStateProvider {
-  private stateFile: SignedStateFile<{
-    txTimestamps: number[];
-    dailySpendUSD: number;
-    lastSpendResetDay: number;
-    lastTxTimestamp: number;
-    isCircuitBreakerTripped: boolean;
-  }>;
-  private saveTimeout: NodeJS.Timeout | null = null;
+  private stateFile: SignedStateFile<PolicyState>;
 
   constructor(filePath: string = "veridex-policy-state.json", secret?: string) {
+    if (
+      process.env.NODE_ENV === "production" &&
+      process.env.POLICY_STATE_SINGLE_WRITER !== "true"
+    ) {
+      throw new Error(
+        "FilePolicyStateProvider is single-process only in production. Use a transactional shared PolicyStateProvider, or explicitly set POLICY_STATE_SINGLE_WRITER=true for a verified one-replica deployment."
+      );
+    }
     this.stateFile = new SignedStateFile(path.resolve(filePath), secret);
   }
 
-  public loadState() {
+  public loadState(): PolicyState {
     // VD-GOAT-011 fix: Use signed state file with HMAC verification
-    const state = this.stateFile.read();
-
-    if (state) {
-      return state;
+    try {
+      const state = this.stateFile.read();
+      if (state) {
+        return state;
+      }
+    } catch (error: any) {
+      // VRD-2026-007 fix: Fail closed on corrupt state in production
+      if (process.env.NODE_ENV === "production" || process.env.STRICT_STATE_PERSISTENCE === "true") {
+        throw new Error(
+          `[Policy State] CRITICAL: State file is corrupt or tampered. ` +
+          `Refusing to start with default state to prevent limit bypass: ${error.message}`
+        );
+      }
+      console.error(`[Policy State] State verification failed: ${error.message}. Using default state (dev mode only).`);
     }
 
-    // Default state if file doesn't exist or verification fails
-    return {
-      txTimestamps: [],
-      dailySpendUSD: 0,
-      lastSpendResetDay: Math.floor(Date.now() / 86400000),
-      lastTxTimestamp: 0,
-      isCircuitBreakerTripped: false,
-    };
+    // Default state only if file doesn't exist yet (first run)
+    return createDefaultPolicyState();
   }
 
   public saveState(state: any): void {
-    // VD-GOAT-011 fix: Circuit breaker writes immediately with atomic fsync
-    if (state.isCircuitBreakerTripped) {
-      try {
-        this.stateFile.write(state);
-      } catch (error: any) {
-        console.error(`[Policy State] Failed to save circuit breaker state: ${error.message}`);
-        // In production with STRICT mode, this should alert/page
-        if (process.env.STRICT_STATE_PERSISTENCE === "true") {
-          throw error;
-        }
+    try {
+      this.stateFile.write(state);
+    } catch (error: any) {
+      console.error(`[Policy State] CRITICAL: Failed to persist state: ${error.message}`);
+      if (process.env.NODE_ENV === "production" || process.env.STRICT_STATE_PERSISTENCE === "true") {
+        throw new Error(`[Policy State] State persistence failure - refusing to continue without durable state: ${error.message}`);
       }
-      return;
     }
-
-    // Debounce normal writes
-    if (this.saveTimeout) {
-      clearTimeout(this.saveTimeout);
-    }
-
-    this.saveTimeout = setTimeout(() => {
-      try {
-        this.stateFile.write(state);
-      } catch (error: any) {
-        console.error(`[Policy State] Failed to save state: ${error.message}`);
-        if (process.env.STRICT_STATE_PERSISTENCE === "true") {
-          throw error;
-        }
-      }
-    }, 50);
   }
 }
 
@@ -88,79 +125,132 @@ export class VeridexPolicyGate {
   private lastSpendResetDay: number = Math.floor(Date.now() / 86400000);
   private lastTxTimestamp: number = 0;
   private isCircuitBreakerTripped: boolean = false;
+  // VRD-2026-007 fix: reservations and processed action IDs are hydrated from and
+  // persisted to durable state so they survive restarts and are not merely
+  // instance-local, and so idempotency keys reject replays across processes.
   private reservedActionIds: Map<string, number> = new Map();
   private processedActionIds: Set<string> = new Set();
+  private readonly readyPromise: Promise<void>;
+  private mutationQueue: Promise<void> = Promise.resolve();
 
   constructor(config: PolicyRuleConfig, stateProvider?: PolicyStateProvider) {
     this.config = config;
     this.stateProvider = stateProvider || new FilePolicyStateProvider();
-    this.loadState();
+    this.readyPromise = this.loadState();
   }
 
-  private loadState(): void {
+  /** Wait for an asynchronous/shared provider to hydrate the policy state. */
+  public async ready(): Promise<void> {
+    await this.readyPromise;
+  }
+
+  private hydrateState(stateInput: Partial<PolicyState> | undefined): void {
+    const state = sanitizePolicyState(stateInput);
+    this.txTimestamps = state.txTimestamps;
+    this.dailySpendUSD = state.dailySpendUSD;
+    this.lastSpendResetDay = state.lastSpendResetDay;
+    this.lastTxTimestamp = state.lastTxTimestamp;
+    this.isCircuitBreakerTripped = state.isCircuitBreakerTripped;
+    this.reservedActionIds = new Map(Object.entries(state.reservations));
+    this.processedActionIds = new Set(state.processedActionIds);
+  }
+
+  private snapshotState(): PolicyState {
+    const processed = Array.from(this.processedActionIds).slice(-10_000);
+    this.processedActionIds = new Set(processed);
+    return {
+      txTimestamps: this.txTimestamps.slice(-10_000),
+      dailySpendUSD: this.dailySpendUSD,
+      lastSpendResetDay: this.lastSpendResetDay,
+      lastTxTimestamp: this.lastTxTimestamp,
+      isCircuitBreakerTripped: this.isCircuitBreakerTripped,
+      reservations: Object.fromEntries(this.reservedActionIds),
+      processedActionIds: processed,
+    };
+  }
+
+  private async loadState(): Promise<void> {
     if (this.stateProvider) {
-      const state = this.stateProvider.loadState();
-      this.txTimestamps = state.txTimestamps || [];
-      this.dailySpendUSD = state.dailySpendUSD || 0;
-      this.lastSpendResetDay = state.lastSpendResetDay ?? Math.floor(Date.now() / 86400000);
-      this.lastTxTimestamp = state.lastTxTimestamp || 0;
-      this.isCircuitBreakerTripped = state.isCircuitBreakerTripped || false;
+      this.hydrateState(await this.stateProvider.loadState());
     }
   }
 
-  private saveState(): void {
+  private async saveState(): Promise<void> {
     if (this.stateProvider) {
-      this.stateProvider.saveState({
-        txTimestamps: this.txTimestamps,
-        dailySpendUSD: this.dailySpendUSD,
-        lastSpendResetDay: this.lastSpendResetDay,
-        lastTxTimestamp: this.lastTxTimestamp,
-        isCircuitBreakerTripped: this.isCircuitBreakerTripped,
+      await this.stateProvider.saveState(this.snapshotState());
+    }
+  }
+
+  /** Serialize mutations for file/in-memory providers and use DB row locks when available. */
+  private async mutate<T>(operation: () => T): Promise<T> {
+    await this.ready();
+    const transactional = this.stateProvider as TransactionalPolicyStateProvider | undefined;
+    if (transactional && typeof transactional.transact === "function") {
+      return transactional.transact((state) => {
+        this.hydrateState(state);
+        const result = operation();
+        return { state: this.snapshotState(), result };
       });
     }
+
+    let release!: () => void;
+    const previous = this.mutationQueue;
+    this.mutationQueue = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      const result = operation();
+      await this.saveState();
+      return result;
+    } finally {
+      release();
+    }
   }
 
-  public tripCircuitBreaker(): void {
-    this.isCircuitBreakerTripped = true;
-    this.saveState();
+  public async tripCircuitBreaker(): Promise<void> {
+    await this.mutate(() => { this.isCircuitBreakerTripped = true; });
   }
 
-  public resetCircuitBreaker(): void {
-    this.isCircuitBreakerTripped = false;
-    this.saveState();
+  public async resetCircuitBreaker(): Promise<void> {
+    await this.mutate(() => { this.isCircuitBreakerTripped = false; });
   }
 
   /**
    * Atomic reservation lock to prevent concurrent daily spend race conditions (CAS).
    */
-  public reserve(actionId: string, amountUSD: number): boolean {
-    if (this.processedActionIds.has(actionId)) {
-      throw new Error(`DUPLICATE_ACTION: Action ${actionId} has already been processed.`);
+  public async reserve(actionId: string, amountUSD: number): Promise<boolean> {
+    if (!actionId || actionId.length > 256 || !Number.isFinite(amountUSD) || amountUSD < 0) {
+      throw new Error("INVALID_RESERVATION: actionId and amountUSD are invalid.");
     }
-
-    if (this.config.spendingLimits) {
-      const { maxDailyUSD } = this.config.spendingLimits;
-      if (this.dailySpendUSD + amountUSD > maxDailyUSD) {
+    return this.mutate(() => {
+      const currentDay = Math.floor(Date.now() / 86400000);
+      if (currentDay !== this.lastSpendResetDay) {
+        this.dailySpendUSD = 0;
+        this.lastSpendResetDay = currentDay;
+      }
+      if (this.processedActionIds.has(actionId) || this.reservedActionIds.has(actionId)) {
+        throw new Error(`DUPLICATE_ACTION: Action ${actionId} has already been processed or is in flight.`);
+      }
+      if (this.config.spendingLimits && this.dailySpendUSD + amountUSD > this.config.spendingLimits.maxDailyUSD) {
         return false;
       }
-    }
-
-    this.dailySpendUSD += amountUSD;
-    this.reservedActionIds.set(actionId, amountUSD);
-    this.saveState();
-    return true;
+      this.dailySpendUSD += amountUSD;
+      this.reservedActionIds.set(actionId, amountUSD);
+      return true;
+    });
   }
 
-  public releaseReservation(actionId: string): void {
-    const reservedAmount = this.reservedActionIds.get(actionId);
-    if (reservedAmount !== undefined) {
-      this.dailySpendUSD = Math.max(0, this.dailySpendUSD - reservedAmount);
-      this.reservedActionIds.delete(actionId);
-      this.saveState();
-    }
+  public async releaseReservation(actionId: string): Promise<void> {
+    await this.mutate(() => {
+      const reservedAmount = this.reservedActionIds.get(actionId);
+      if (reservedAmount !== undefined) {
+        this.dailySpendUSD = Math.max(0, this.dailySpendUSD - reservedAmount);
+        this.reservedActionIds.delete(actionId);
+      }
+    });
   }
 
   public async evaluate(ctxInput: PaymentContext | NormalizedAction): Promise<PolicyEvaluation> {
+    await this.ready();
     const evaluatedAt = Date.now();
     const checks: PolicyCheckResult[] = [];
     let riskScore = 0;
@@ -209,7 +299,7 @@ export class VeridexPolicyGate {
     }
 
     // 1. Asset Whitelist Check
-    const assetStr = ctx.asset || "GOAT";
+    const assetStr = ctx.symbol || ctx.asset || "GOAT";
     if (this.config.allowedAssets && this.config.allowedAssets.length > 0) {
       const isAllowed = this.config.allowedAssets.includes(assetStr.toUpperCase());
       checks.push({
@@ -308,7 +398,7 @@ export class VeridexPolicyGate {
 
     if (this.config.circuitBreaker && this.config.circuitBreaker.tripOnHighRiskScore) {
       if (riskScore >= this.config.circuitBreaker.tripOnHighRiskScore) {
-        this.isCircuitBreakerTripped = true;
+        await this.mutate(() => { this.isCircuitBreakerTripped = true; });
         finalVerdict = "deny";
         reasons.push(`Circuit breaker tripped due to high risk score: ${riskScore}`);
       }
@@ -332,21 +422,23 @@ export class VeridexPolicyGate {
     };
   }
 
-  public commit(amountUSD: number, evaluatedAt: number = Date.now(), actionId?: string): void {
-    const currentDay = Math.floor(evaluatedAt / 86400000);
-    if (currentDay !== this.lastSpendResetDay) {
-      this.dailySpendUSD = 0;
-      this.lastSpendResetDay = currentDay;
-    }
+  public async commit(amountUSD: number, evaluatedAt: number = Date.now(), actionId?: string): Promise<void> {
+    if (!Number.isFinite(amountUSD) || amountUSD < 0) throw new Error("INVALID_COMMIT: amountUSD is invalid.");
+    await this.mutate(() => {
+      const currentDay = Math.floor(evaluatedAt / 86400000);
+      if (currentDay !== this.lastSpendResetDay) {
+        this.dailySpendUSD = 0;
+        this.lastSpendResetDay = currentDay;
+      }
 
-    this.txTimestamps.push(evaluatedAt);
-    if (actionId && this.reservedActionIds.has(actionId)) {
-      this.reservedActionIds.delete(actionId);
-      this.processedActionIds.add(actionId);
-    } else {
-      this.dailySpendUSD += amountUSD;
-    }
-    this.lastTxTimestamp = evaluatedAt;
-    this.saveState();
+      this.txTimestamps.push(evaluatedAt);
+      if (actionId && this.reservedActionIds.has(actionId)) {
+        this.reservedActionIds.delete(actionId);
+        this.processedActionIds.add(actionId);
+      } else {
+        this.dailySpendUSD += amountUSD;
+      }
+      this.lastTxTimestamp = evaluatedAt;
+    });
   }
 }

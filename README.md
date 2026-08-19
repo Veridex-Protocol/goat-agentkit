@@ -74,30 +74,55 @@ const veridexWallet = wrapWalletAdapter(goatWalletAdapter, {
 
 ## 🔐 Zero-Dependency Evidence Verification
 
-Anyone can verify an ERC-8004 evidence bundle off-chain with 3 lines of standard `ethers.js`:
+Anyone can verify an ERC-8004 evidence bundle off-chain using `@veridex/goat-agentkit` or standard `ethers.js` v6:
 
+### Using the SDK Verifier:
+```typescript
+import { verifyEvidenceBundle } from "@veridex/goat-agentkit";
+
+const isValid = await verifyEvidenceBundle(bundle);
+console.log("Evidence bundle signature and trace validity:", isValid);
+```
+
+### Or using vanilla `ethers.js` (EIP-712 Typed Data Verification):
 ```typescript
 import { ethers } from "ethers";
 
-// 1. Re-hash trace payload
-const traceHash = bundle.traceHash;
+const domain = {
+  name: "Veridex Evidence Registry",
+  version: "2",
+  chainId: bundle.evidence.chainId,
+  verifyingContract: bundle.evidence.registryAddress,
+};
 
-// 2. Recover Session Key signer address
-const recoveredAddress = ethers.verifyMessage(
-  ethers.getBytes(traceHash),
+const types = {
+  EvidenceTrace: [
+    { name: "agentId", type: "string" },
+    { name: "traceHash", type: "bytes32" },
+    { name: "bundleHash", type: "bytes32" },
+    { name: "sessionSigner", type: "address" },
+    { name: "timestamp", type: "uint256" },
+  ],
+};
+
+const recoveredSigner = ethers.verifyTypedData(
+  domain,
+  types,
+  bundle.evidence,
   bundle.signature
 );
 
-console.log("Verified Session Key Signer:", recoveredAddress);
+console.log("Recovered Session Signer:", recoveredSigner);
 ```
 
 ---
 
-## 🔗 On-Chain Contracts (GOAT Network Testnet3)
+## 🛠️ Hardware KMS & Contract Deployment
 
-| Contract | Address | Explorer Link |
-| :--- | :--- | :--- |
-| **`EvidenceRegistry.sol`** | `0x40D9B16094808Fa48e73598E31AB964Cf15b475f` | [GOAT Testnet3 Explorer](https://explorer.testnet3.goat.network/address/0x40D9B16094808Fa48e73598E31AB964Cf15b475f) |
+### Deploying the EvidenceRegistry:
+```bash
+AWS_KMS_KEY_ID="arn:aws:kms:..." npx tsx scripts/deployRegistry.ts
+```
 
 ---
 

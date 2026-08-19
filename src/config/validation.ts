@@ -35,7 +35,38 @@ export function validateBootConfiguration(env: Record<string, string | undefined
     errors.push("RELAYER_PRIVATE_KEY must be a valid 64-character hex private key");
   }
 
-  // 4. Check for placeholder/test values in production
+  // 4. Browser-facing deployments use OIDC. Internal dashboard-to-agent calls
+  // are body-bound HMAC requests with one-time nonces, never static bearers.
+  if (isProduction && (!env.INTERNAL_AGENT_HMAC_SECRET || env.INTERNAL_AGENT_HMAC_SECRET.trim().length < 32)) {
+    errors.push("INTERNAL_AGENT_HMAC_SECRET is required in production and must be >= 32 characters");
+  }
+
+  // 5. Validate PRIVATE_KEY/RELAYER key in production
+  const privateKey = env.PRIVATE_KEY || env.RELAYER_PRIVATE_KEY;
+  if (isProduction && !privateKey) {
+    errors.push("PRIVATE_KEY or RELAYER_PRIVATE_KEY is required in production");
+  }
+  if (privateKey && !/^(0x)?[0-9a-fA-F]{64}$/.test(privateKey.trim())) {
+    errors.push("PRIVATE_KEY or RELAYER_PRIVATE_KEY must be a valid 64-character hex private key");
+  }
+
+  // 6. Durable policy state must be signed with a stable vault-provided secret.
+  if (isProduction && (!env.STATE_SIGNING_SECRET || env.STATE_SIGNING_SECRET.trim().length < 32)) {
+    errors.push("STATE_SIGNING_SECRET is required in production and must be >= 32 characters");
+  }
+
+  // 7. A signed file is safe only for an explicitly verified one-replica
+  // deployment. A production service must use shared transactional state so
+  // spend caps and x402 nonce consumption are atomic across replicas.
+  const policyDatabaseUrl = env.POLICY_STATE_DATABASE_URL;
+  if (isProduction && !policyDatabaseUrl) {
+    errors.push("POLICY_STATE_DATABASE_URL is required in production for transactional policy and x402 nonce state");
+  }
+  if (policyDatabaseUrl && !/^postgres(?:ql)?:\/\//i.test(policyDatabaseUrl)) {
+    errors.push("POLICY_STATE_DATABASE_URL must be a PostgreSQL connection URL");
+  }
+
+  // 8. Check for placeholder/test values in production
   if (isProduction) {
     if (registryAddr?.toLowerCase().includes("test") || registryAddr?.toLowerCase().includes("placeholder")) {
       errors.push("Production detected but registry address contains 'test' or 'placeholder'");

@@ -40,14 +40,22 @@ export class AwsNitroKmsAttestationProvider implements AttestationProvider {
         // We invoke the nsm-cli system tool to fetch the CBOR attestation document securely.
         const output = execSync(`/usr/bin/nsm-cli --user-data ${boundHash} --raw`, { stdio: "pipe" });
         const hexQuote = output.toString("hex");
-        const pcr0 = "0x8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b";
 
+        // VRD-2026-006 fix: Do not fabricate a PCR0. The measurement must be parsed
+        // from the CBOR attestation document and verified against a KMS PCR0
+        // condition/allowlist by the caller. We surface the raw quote and mark the
+        // measurement as not-yet-extracted rather than returning a plausible fake.
+        if (process.env.NODE_ENV === "production") {
+          throw new Error("[AWS Nitro TEE Driver] A raw NSM document is not verified. Configure a CBOR/KMS verification provider before enabling production evidence.");
+        }
         return {
           provider: "aws-nitro-enclave",
           quote: hexQuote,
-          measurement: pcr0,
+          measurement: "0x0000000000000000000000000000000000000000000000000000000000000000",
           boundHash,
           timestamp,
+          verificationStatus: "unverified: PCR0 requires CBOR parsing + KMS attestation policy check",
+          verified: false,
         };
       }
     } catch (e) {
@@ -58,13 +66,17 @@ export class AwsNitroKmsAttestationProvider implements AttestationProvider {
       throw new Error("[AWS Nitro TEE Driver] Production Environment Error: NSM hardware device or enclave CLI is unavailable.");
     }
 
-    // Fallback if running in non-enclave EC2 or local environment
+    // VRD-2026-006 fix: When no NSM hardware is present we return an explicitly
+    // UNVERIFIED software report with a zeroed measurement. We never reuse the
+    // hardware provider label or a plausible-looking PCR0 for placeholder evidence.
     return {
-      provider: "aws-nitro-enclave",
+      provider: "software",
       quote: "LIVE_AWS_NITRO_NSM_UNAVAILABLE_LOCAL_ENV",
-      measurement: "0x8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b",
+      measurement: "0x0000000000000000000000000000000000000000000000000000000000000000",
       boundHash,
       timestamp,
+      verificationStatus: "unverified: NSM hardware unavailable (software fallback)",
+      verified: false,
     };
   }
 }

@@ -1,6 +1,7 @@
 export * from "./wrapper.js";
 export * from "./policy/rules.js";
 export * from "./policy/gate.js";
+export * from "./policy/postgres.js";
 export * from "./policy/decoder.js";
 export * from "./types/action.js";
 export * from "./evidence/builder.js";
@@ -16,3 +17,6 @@ export * from "./erc8004/goatContracts.js";
 export * from "./x402/goatX402.js";
 export * from "./utils/serialize.js";
 export * from "./config/validation.js";
+export * from "./session/mandate.js";
+export * from "./session/revocation.js";
+export * from "./kms/kmsSigner.js";

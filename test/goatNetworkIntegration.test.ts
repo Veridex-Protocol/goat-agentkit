@@ -7,6 +7,7 @@ import {
   EvidenceBuilder,
   GoatERC8004Client,
   VeridexPolicyGate,
+  InMemoryX402NonceStore,
 } from "../src/index.js";
 import { ethers } from "ethers";
 import * as fs from "fs";
@@ -24,12 +25,14 @@ describe("GOAT Network ERC-8004 & x402 Integration Spec", () => {
   it("should provide canonical GOAT Network ERC-8004 contract addresses", () => {
     expect(GOAT_ERC8004_ADDRESSES.mainnet.identityRegistry).toBe("0x8004A169FB4a3325136EB29fA0ceB6D2e539a432");
     expect(GOAT_ERC8004_ADDRESSES.mainnet.reputationRegistry).toBe("0x8004BAa17C55a88189AE136b182e5fdA19dE9b63");
-    expect(GOAT_ERC8004_ADDRESSES.mainnet.validationRegistry).toBe("0x8004CAbcDe123456789012345678901234567890");
+    // validationRegistry is now read from env (GOAT_MAINNET_VALIDATION_REGISTRY) — no hardcoded address
+    expect(typeof GOAT_ERC8004_ADDRESSES.mainnet.validationRegistry).toBe("string");
     expect(GOAT_ERC8004_ADDRESSES.mainnet.agentRegistryId).toBe("eip155:2345:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432");
 
     expect(GOAT_ERC8004_ADDRESSES.testnet3.identityRegistry).toBe("0x556089008Fc0a60cD09390Eca93477ca254A5522");
     expect(GOAT_ERC8004_ADDRESSES.testnet3.reputationRegistry).toBe("0xd9140951d8aE6E5F625a02F5908535e16e3af964");
-    expect(GOAT_ERC8004_ADDRESSES.testnet3.validationRegistry).toBe("0x8004C0De00000000000000000000000000000000");
+    // validationRegistry is now read from env (GOAT_TESTNET_VALIDATION_REGISTRY) — no hardcoded address
+    expect(typeof GOAT_ERC8004_ADDRESSES.testnet3.validationRegistry).toBe("string");
     expect(GOAT_ERC8004_ADDRESSES.testnet3.agentRegistryId).toBe("eip155:48816:0x556089008Fc0a60cD09390Eca93477ca254A5522");
   });
 
@@ -51,7 +54,7 @@ describe("GOAT Network ERC-8004 & x402 Integration Spec", () => {
       chain: 30,
     });
     expect(res1.verdict).toBe("pass");
-    gate.commit(1, res1.evaluatedAt);
+    await gate.commit(1, res1.evaluatedAt);
 
     // Second evaluation immediately following should fail due to time-lock cooldown
     const res2 = await gate.evaluate({
@@ -65,7 +68,7 @@ describe("GOAT Network ERC-8004 & x402 Integration Spec", () => {
     expect(res2.reasons[0]).toContain("Cooldown");
 
     // Violating a rule that trips high risk should activate circuit breaker
-    gate.resetCircuitBreaker();
+    await gate.resetCircuitBreaker();
     const highRiskRes = await gate.evaluate({
       recipient: "0x1111111111111111111111111111111111111111",
       amount: 250, // exceeds max limit, causing high risk
@@ -74,7 +77,7 @@ describe("GOAT Network ERC-8004 & x402 Integration Spec", () => {
       chain: 30,
     });
     expect(highRiskRes.verdict).toBe("deny");
-    gate.commit(250, highRiskRes.evaluatedAt);
+    await gate.commit(250, highRiskRes.evaluatedAt);
 
     // Subsequent normal transaction should now be blocked by tripped circuit breaker
     const resBlocked = await gate.evaluate({
@@ -161,14 +164,14 @@ describe("GOAT Network ERC-8004 & x402 Integration Spec", () => {
       accepts: "USDC",
       priceUSDC: "2500000",
       amountUSD: 2.5,
-      payTo: "0x9A7c3f5B2e8D14a6C0f9E7b2D5a8F1c3B4d6E0a2",
+      payTo: "0x9a7c3f5b2e8d14a6c0f9e7b2d5a8f1c3b4d6e0a2",
       chain: 30,
       scheme: "authorization",
     };
 
     const challenge = parseX402Challenge(mockHeaders, mockResponseBody);
     expect(challenge.status).toBe(402);
-    expect(challenge.payTo).toBe("0x9A7c3f5B2e8D14a6C0f9E7b2D5a8F1c3B4d6E0a2");
+    expect(challenge.payTo).toBe("0x9a7c3f5b2e8d14a6c0f9e7b2d5a8f1c3b4d6e0a2");
     expect(challenge.amountUSD).toBe(2.5);
   });
 
@@ -182,20 +185,42 @@ describe("GOAT Network ERC-8004 & x402 Integration Spec", () => {
     });
 
     const mockWallet = {
-      sendTransaction: async () => ({ hash: "0x5d8e2c1a9f4b7306e2a5c1d9b3f80547a6e9c2b1d3f4a80c5e7b1d9a3f60528e" }),
+      sendTransaction: async () => ({
+        hash: "0x5d8e2c1a9f4b7306e2a5c1d9b3f80547a6e9c2b1d3f4a80c5e7b1d9a3f60528e",
+        receipt: { status: 1, chain: 30 },
+      }),
     };
 
-    const challenge = {
+    const merchant = ethers.Wallet.createRandom();
+    const challenge: any = {
       status: 402,
       accepts: "USDC",
       amount: "2500000",
       amountUSD: 2.5,
-      payTo: "0x9A7c3f5B2e8D14a6C0f9E7b2D5a8F1c3B4d6E0a2",
+      payTo: "0x9a7c3f5b2e8d14a6c0f9e7b2d5a8f1c3b4d6e0a2",
       chain: 30,
       scheme: "authorization" as const,
+      nonce: "integration-nonce-1",
+      validBefore: Math.floor(Date.now() / 1000) + 300,
+      merchantPublicKey: merchant.address,
     };
+    challenge.signature = await merchant.signMessage(JSON.stringify({
+      accepts: challenge.accepts, amount: challenge.amount, amountUSD: challenge.amountUSD,
+      payTo: challenge.payTo, chain: challenge.chain, scheme: challenge.scheme,
+      nonce: challenge.nonce, validAfter: challenge.validAfter, validBefore: challenge.validBefore,
+    }));
+    const normalizedAction: any = Object.freeze({
+      actionId: ethers.id("integration-bound-action"), chainId: 30,
+      from: "0x1111111111111111111111111111111111111111", to: challenge.payTo,
+      value: 2500000n, assetType: "erc20", symbol: "USDC",
+      tokenAddress: "0x2222222222222222222222222222222222222222", calldataSelector: "0xa9059cbb",
+      decimals: 6, priceUSD: 1, usdValue: 2.5,
+    });
 
-    const res = await payer.executeX402Payment(challenge, mockWallet);
+    const res = await payer.executeX402Payment(challenge, normalizedAction, mockWallet, {
+      nonceStore: new InMemoryX402NonceStore(),
+      allowedMerchants: new Set([merchant.address.toLowerCase()]),
+    });
     expect(res.txHash).toBe("0x5d8e2c1a9f4b7306e2a5c1d9b3f80547a6e9c2b1d3f4a80c5e7b1d9a3f60528e");
     expect(res.evidenceBundle.verdict.verdict).toBe("pass");
 

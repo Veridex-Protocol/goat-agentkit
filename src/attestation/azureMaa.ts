@@ -1,7 +1,7 @@
 import { keccak256, toUtf8Bytes } from "ethers";
 import fs from "fs";
 import { execSync } from "child_process";
-import { createVerify } from "crypto";
+import { createVerify, X509Certificate } from "crypto";
 import { AttestationProvider, TEEAttestationReport, TEEProviderType } from "./types.js";
 
 function decodeBase64Url(str: string): string {
@@ -60,10 +60,10 @@ export class AzureMaaAttestationProvider implements AttestationProvider {
         const jwtToken = json.quote || json.attestationToken || json.token;
 
         if (jwtToken) {
-          const parsed = this.parseMaaJwt(jwtToken);
+          const parsed = this.parseMaaJwt(jwtToken, boundHash);
 
           // VD-GOAT-007 fix: Check JWT verification status
-          if (!parsed.verified && process.env.STRICT_TEE === "true") {
+          if (!parsed.verified && this.requiresVerifiedAttestation()) {
             throw new Error(`[Azure MAA] JWT verification failed: ${parsed.error}`);
           }
 
@@ -75,6 +75,7 @@ export class AzureMaaAttestationProvider implements AttestationProvider {
             issuerCertChain: parsed.certChain,
             timestamp,
             verificationStatus: parsed.verified ? "verified" : `unverified: ${parsed.error}`,
+            verified: parsed.verified,
           };
         }
       }
@@ -90,19 +91,24 @@ export class AzureMaaAttestationProvider implements AttestationProvider {
         const hexQuote = res.quote || res.attestationToken || res.token || res.raw_quote;
         const measurement = res.measurement || "0x2b8d4056a1f3e7c9b0d2854f6a9e1c3b7d05f28a4c6e1b9d3f705a2c8f3a1c7e9";
 
+        if (this.requiresVerifiedAttestation()) {
+          throw new Error("[Azure MAA] Direct device quote has no configured remote verification path");
+        }
         return {
           provider: "azure-maa/sev-snp",
           quote: hexQuote,
           measurement,
           boundHash,
           timestamp,
+          verificationStatus: "unverified: local quote was not verified against Azure MAA trust roots",
+          verified: false,
         };
       }
     } catch {
       // Hardware device unavailable
     }
 
-    if (process.env.NODE_ENV === "production" && process.env.STRICT_TEE === "true") {
+    if (this.requiresVerifiedAttestation()) {
       throw new Error("[Azure TEE Driver] Production Environment Error: Hardware attestation failed or SEV-SNP device is unavailable.");
     }
 
@@ -113,14 +119,22 @@ export class AzureMaaAttestationProvider implements AttestationProvider {
       measurement: "0x0000000000000000000000000000000000000000000000000000000000000000",
       boundHash,
       timestamp,
+      verificationStatus: "unverified: software fallback",
+      verified: false,
     };
+  }
+
+  private requiresVerifiedAttestation(): boolean {
+    // A production runtime must never emit hardware-labelled evidence from a
+    // merely parseable quote. Development can opt into the same posture.
+    return process.env.NODE_ENV === "production" || process.env.STRICT_TEE === "true";
   }
 
   /**
    * Parses and verifies Microsoft Azure Attestation JWT token.
    * VD-GOAT-007 fix: Added signature, issuer, audience, expiry verification.
    */
-  private parseMaaJwt(jwt: string): { measurement?: string; certChain?: string[]; verified: boolean; error?: string } {
+  private parseMaaJwt(jwt: string, expectedBoundHash?: string): { measurement?: string; certChain?: string[]; verified: boolean; error?: string } {
     try {
       const parts = jwt.split(".");
       if (parts.length !== 3) {
@@ -130,10 +144,23 @@ export class AzureMaaAttestationProvider implements AttestationProvider {
       const header = JSON.parse(decodeBase64Url(parts[0]));
       const payload = JSON.parse(decodeBase64Url(parts[1]));
       const signature = parts[2];
+      const strict = this.requiresVerifiedAttestation();
 
-      // 1. Verify issuer (should be Azure MAA endpoint)
-      if (payload.iss && !payload.iss.includes("attest.azure.net")) {
-        return { verified: false, error: `Untrusted issuer: ${payload.iss}` };
+      if (header.alg !== "RS256") {
+        return { verified: false, error: `Unexpected JWT algorithm ${header.alg || "(missing)"}` };
+      }
+
+      // 1. Verify issuer (must be an Azure MAA endpoint with strict URL validation)
+      if (!payload.iss) {
+        return { verified: false, error: "Missing issuer (iss) claim" };
+      }
+      try {
+        const issuerUrl = new URL(payload.iss);
+        if (issuerUrl.protocol !== "https:" || !issuerUrl.hostname.endsWith(".attest.azure.net")) {
+          return { verified: false, error: `Untrusted issuer: ${payload.iss} (must be https://*.attest.azure.net)` };
+        }
+      } catch {
+        return { verified: false, error: `Invalid issuer URL: ${payload.iss}` };
       }
 
       // 2. Verify expiry
@@ -152,15 +179,25 @@ export class AzureMaaAttestationProvider implements AttestationProvider {
         payload["x-ms-sevsnpvm-launchmeasurement"] ||
         payload["x-ms-isolation-tee"]?.["launch-measurement"];
 
+      // 4b. Verify audience (if configured)
+      const expectedAudience = process.env.AZURE_MAA_AUDIENCE;
+      if (strict && !expectedAudience) {
+        return { verified: false, error: "AZURE_MAA_AUDIENCE is required when verified attestation is required" };
+      }
+      if (expectedAudience && payload.aud !== expectedAudience) {
+        return { verified: false, error: `Audience mismatch: got ${payload.aud}, expected ${expectedAudience}` };
+      }
+
       // 5. VD-GOAT-007 complete fix: Verify RS256 signature with x5c certificate chain
       let signatureVerified = false;
       let signatureError: string | undefined;
 
       if (header.x5c && header.x5c.length > 0) {
         try {
-          // x5c[0] is the signing certificate (DER-encoded, base64)
-          const certDer = Buffer.from(header.x5c[0], "base64");
-          const certPem = `-----BEGIN CERTIFICATE-----\n${header.x5c[0].match(/.{1,64}/g)?.join('\n')}\n-----END CERTIFICATE-----`;
+          const certificates = header.x5c.map((encoded: string) =>
+            new X509Certificate(Buffer.from(encoded, "base64"))
+          );
+          const leaf = certificates[0];
 
           // Construct signed data (JWT header + payload)
           const signedData = `${parts[0]}.${parts[1]}`;
@@ -168,13 +205,42 @@ export class AzureMaaAttestationProvider implements AttestationProvider {
           // Decode signature from base64url
           const signatureBytes = Buffer.from(signature.replace(/-/g, "+").replace(/_/g, "/"), "base64");
 
-          // Verify RS256 signature
+          // Verify RS256 signature against the leaf certificate
           const verifier = createVerify("RSA-SHA256");
           verifier.update(signedData);
-          signatureVerified = verifier.verify(certPem, signatureBytes);
+          signatureVerified = verifier.verify(leaf.toString(), signatureBytes);
 
           if (!signatureVerified) {
-            signatureError = "RS256 signature verification failed";
+            signatureError = "RS256 signature verification failed against x5c[0]";
+          }
+
+          // VRD-2026-006 fix: Validate certificate chain is rooted in Microsoft
+          if (signatureVerified && certificates.length < 2) {
+            signatureVerified = false;
+            signatureError = "Certificate chain too short: x5c must include intermediate and root certificates from Microsoft";
+          }
+
+          if (signatureVerified && certificates.length >= 2) {
+            for (let i = 0; i < certificates.length - 1; i++) {
+              if (!certificates[i].verify(certificates[i + 1].publicKey)) {
+                signatureVerified = false;
+                signatureError = `x5c certificate chain validation failed at certificate ${i}`;
+                break;
+              }
+            }
+            const configuredRoots = process.env.AZURE_MAA_TRUSTED_ROOT_FINGERPRINTS;
+            if (signatureVerified && strict && !configuredRoots) {
+              signatureVerified = false;
+              signatureError = "AZURE_MAA_TRUSTED_ROOT_FINGERPRINTS is required when verified attestation is required";
+            }
+            if (signatureVerified && configuredRoots) {
+              const trusted = new Set(configuredRoots.split(",").map((value) => value.replace(/:/g, "").trim().toUpperCase()));
+              const rootFingerprint = certificates[certificates.length - 1].fingerprint256.replace(/:/g, "").toUpperCase();
+              if (!trusted.has(rootFingerprint)) {
+                signatureVerified = false;
+                signatureError = "x5c chain terminates in a root not present in AZURE_MAA_TRUSTED_ROOT_FINGERPRINTS";
+              }
+            }
           }
         } catch (error: any) {
           signatureVerified = false;
@@ -182,6 +248,42 @@ export class AzureMaaAttestationProvider implements AttestationProvider {
         }
       } else {
         signatureError = "No x5c certificate chain in JWT header";
+      }
+
+      // 6. VRD-2026-006 fix: Bind runtime data / report data to the expected
+      // boundHash. A hardware-backed token must carry the exact value we asked the
+      // TEE to attest; otherwise the attestation is not bound to this trace.
+      if (signatureVerified && expectedBoundHash) {
+        const reportData: string | undefined =
+          payload["x-ms-sevsnpvm-reportdata"] ||
+          payload["x-ms-runtime"]?.["report-data"] ||
+          payload["x-ms-runtime"]?.["user-data"] ||
+          payload["nonce"] ||
+          payload["runtime_data"]?.["user-data"];
+        const norm = (s: string) => s.toLowerCase().replace(/^0x/, "");
+        const want = norm(expectedBoundHash);
+        if (!reportData) {
+          signatureVerified = false;
+          signatureError = "No runtime/report data claim to bind against expected boundHash";
+        } else if (norm(String(reportData)) !== want) {
+          signatureVerified = false;
+          signatureError = `Runtime data does not match expected boundHash`;
+        }
+      }
+
+      // 7. VRD-2026-006 fix: Enforce an approved measurement allowlist if configured.
+      const allowed = process.env.AZURE_MAA_ALLOWED_MEASUREMENTS;
+      if (strict && !allowed) {
+        signatureVerified = false;
+        signatureError = "AZURE_MAA_ALLOWED_MEASUREMENTS is required when verified attestation is required";
+      }
+      if (signatureVerified && allowed) {
+        const allowedSet = new Set(allowed.split(",").map((m) => m.trim().toLowerCase().replace(/^0x/, "")));
+        const m = measurement ? String(measurement).toLowerCase().replace(/^0x/, "") : "";
+        if (!m || !allowedSet.has(m)) {
+          signatureVerified = false;
+          signatureError = `Measurement ${m || "(missing)"} not in approved allowlist`;
+        }
       }
 
       return {
@@ -205,6 +307,7 @@ export class AzureMaaAttestation {
       quote: report.quote,
       measurement: report.measurement,
       boundHash: report.boundHash,
+      verified: report.verified === true,
     };
   }
 }

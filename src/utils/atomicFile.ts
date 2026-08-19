@@ -79,12 +79,13 @@ export function readFileAtomic(
   encoding: BufferEncoding = "utf8"
 ): string | null {
   try {
-    if (!fs.existsSync(filePath)) {
-      return null;
-    }
     return fs.readFileSync(filePath, encoding);
-  } catch (error) {
-    return null;
+  } catch (error: any) {
+    // Missing state is a legitimate first-run condition. Permission, I/O, and
+    // corruption-adjacent failures are not: callers must be able to fail
+    // closed instead of treating them as an empty policy state.
+    if (error?.code === "ENOENT") return null;
+    throw error;
   }
 }
 
@@ -103,11 +104,14 @@ export class SignedStateFile<T> {
 
   constructor(filePath: string, secret?: string) {
     this.filePath = filePath;
-    // Use env var or generate ephemeral secret
-    this.secret = Buffer.from(
-      secret || process.env.STATE_SIGNING_SECRET || crypto.randomBytes(32).toString("hex"),
-      "hex"
-    );
+    const configuredSecret = secret || process.env.STATE_SIGNING_SECRET;
+    if (!configuredSecret && process.env.NODE_ENV === "production") {
+      throw new Error("STATE_SIGNING_SECRET is required for signed state in production");
+    }
+    // Hash UTF-8 input rather than interpreting an arbitrary environment value
+    // as hexadecimal. This yields a stable 256-bit HMAC key for any valid
+    // vault-provided secret.
+    this.secret = crypto.createHash("sha256").update(configuredSecret || crypto.randomBytes(32)).digest();
   }
 
   /**
@@ -124,7 +128,7 @@ export class SignedStateFile<T> {
       hmac,
     };
 
-    writeFileAtomic(this.filePath, JSON.stringify(signed, null, 2));
+    writeFileAtomic(this.filePath, JSON.stringify(signed, null, 2), { mode: 0o600 });
   }
 
   /**
@@ -143,7 +147,12 @@ export class SignedStateFile<T> {
       const dataJson = JSON.stringify(signed.data);
       const expectedHmac = crypto.createHmac("sha256", this.secret).update(dataJson).digest("hex");
 
-      if (signed.hmac !== expectedHmac) {
+      const suppliedHmac = Buffer.from(String(signed.hmac), "utf8");
+      const expectedHmacBytes = Buffer.from(expectedHmac, "utf8");
+      if (
+        suppliedHmac.length !== expectedHmacBytes.length ||
+        !crypto.timingSafeEqual(suppliedHmac, expectedHmacBytes)
+      ) {
         throw new Error("HMAC verification failed - state file tampered");
       }
 
@@ -155,12 +164,10 @@ export class SignedStateFile<T> {
 
       return signed.data;
     } catch (error: any) {
-      if (process.env.STRICT_STATE_INTEGRITY === "true") {
-        throw new Error(`State integrity check failed: ${error.message}`);
-      }
-      // Fail-safe: return null and log
-      console.error(`[State Integrity Error] ${error.message}`);
-      return null;
+      // Never map a malformed or tampered signed state to an empty state. The
+      // caller may choose a development recovery workflow, but must do so
+      // explicitly rather than accidentally resetting spend/revocation data.
+      throw new Error(`State integrity check failed: ${error.message}`);
     }
   }
 }

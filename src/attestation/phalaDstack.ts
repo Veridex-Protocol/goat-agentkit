@@ -35,24 +35,34 @@ export class PhalaDstackAttestationProvider implements AttestationProvider {
 
       if (response.ok) {
         const json: any = await response.json();
+        if (process.env.NODE_ENV === "production") {
+          throw new Error("[Phala TEE Driver] Quote verification is not implemented; refusing production evidence.");
+        }
         return {
           provider: "phala-dstack",
           quote: json.quote || json.attestation || json.token,
           measurement: json.mrEnclave || json.measurement || "0x3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d",
           boundHash,
           timestamp,
+          verificationStatus: "unverified: dstack quote signature and measurement were not verified",
+          verified: false,
         };
       }
     } catch {
       // dstack unavailable
     }
 
+    if (process.env.NODE_ENV === "production") {
+      throw new Error("[Phala TEE Driver] dstack quote unavailable or unverified in production.");
+    }
     return {
-      provider: "phala-dstack",
+      provider: "software",
       quote: "LIVE_PHALA_DSTACK_UNAVAILABLE_LOCAL_ENV",
       measurement: "0x3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d",
       boundHash,
       timestamp,
+      verificationStatus: "unverified: dstack unavailable (software fallback)",
+      verified: false,
     };
   }
 }

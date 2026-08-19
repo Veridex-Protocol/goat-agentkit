@@ -21,7 +21,13 @@ try {
 
 // Config GOAT Network RPC
 const GOAT_RPC = "https://rpc.testnet3.goat.network";
-const PRIVATE_KEY = process.env.PRIVATE_KEY || "0xb4daccf91e251bc968dbbbbd1ecd689433a7797e7900e881e653bc3d20965a7c";
+const PRIVATE_KEY = process.env.PRIVATE_KEY;
+
+if (!PRIVATE_KEY || PRIVATE_KEY.trim().length === 0) {
+  console.error("ERROR: PRIVATE_KEY environment variable is required for deployment.");
+  console.error("Usage: PRIVATE_KEY=0x... node scripts/deploy.js");
+  process.exit(1);
+}
 
 async function main() {
   const provider = new ethers.JsonRpcProvider(GOAT_RPC);
@@ -45,10 +51,21 @@ async function main() {
   console.log("Deploying EvidenceRegistry contract...");
   try {
     const result = await deployEvidenceRegistry(wallet);
+    const runtimeBytecode = await provider.getCode(result.address);
+    const codeHash = ethers.keccak256(runtimeBytecode);
+    const contract = new ethers.Contract(result.address, EVIDENCE_REGISTRY_ABI, provider);
+    const owner = await contract.owner();
+
     console.log(`\n==================================================`);
     console.log(`🎉 EvidenceRegistry successfully deployed!`);
     console.log(`Contract Address: ${result.address}`);
     console.log(`Transaction Hash: ${result.txHash}`);
+    console.log(`\nCopy and paste this exact block into your agent's .env:`);
+    console.log(`--------------------------------------------------`);
+    console.log(`EVIDENCE_REGISTRY_ADDRESS=${result.address}`);
+    console.log(`EVIDENCE_REGISTRY_CODE_HASH=${codeHash}`);
+    console.log(`EVIDENCE_REGISTRY_OWNER=${owner}`);
+    console.log(`EVIDENCE_ANCHORING_ENABLED=true`);
     console.log(`==================================================\n`);
   } catch (err) {
     console.error("Deployment failed:", err.message);

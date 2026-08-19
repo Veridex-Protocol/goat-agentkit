@@ -4,6 +4,7 @@
 
 export type TEEProviderType =
   | "azure-maa/sev-snp"
+  | "azure-maa/sev-snp-unverified"
   | "azure-maa/tdx"
   | "aws-nitro-enclave"
   | "phala-dstack"
@@ -18,6 +19,9 @@ export interface TEEAttestationReport {
   boundHash: string; // keccak256 hash of policy verdict & trace
   issuerCertChain?: string[];
   timestamp: number;
+  verificationStatus?: string;
+  /** True only after signature, trust-root, freshness, measurement, and trace binding checks pass. */
+  verified?: boolean;
 }
 
 export interface AttestationProvider {

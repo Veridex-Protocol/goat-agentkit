@@ -19,7 +19,9 @@ export const GOAT_ERC8004_ADDRESSES = {
     chainId: 2345,
     identityRegistry: getChecksumAddress("0x8004A169FB4a3325136EB29fA0ceB6D2e539a432"),
     reputationRegistry: getChecksumAddress("0x8004BAa17C55a88189AE136b182e5fdA19dE9b63"),
-    validationRegistry: getChecksumAddress("0x8004cabcde123456789012345678901234567890"),
+    // VRD-2026-009 fix: no published mainnet Validation Registry mapping.
+    // Configure via env only; do not alias another registry's address.
+    validationRegistry: process.env.GOAT_MAINNET_VALIDATION_REGISTRY || "",
     // VD-GOAT-015 fix: Remove zero address placeholder - MUST set via config or env
     evidenceRegistry: process.env.GOAT_MAINNET_EVIDENCE_REGISTRY || "",
     agentRegistryId: "eip155:2345:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432",
@@ -28,11 +30,57 @@ export const GOAT_ERC8004_ADDRESSES = {
     chainId: 48816,
     identityRegistry: getChecksumAddress("0x556089008Fc0a60cD09390Eca93477ca254A5522"),
     reputationRegistry: getChecksumAddress("0xd9140951d8aE6E5F625a02F5908535e16e3af964"),
-    validationRegistry: getChecksumAddress("0x556089008Fc0a60cD09390Eca93477ca254A5522"),
+    // VRD-2026-009 fix: GOAT docs publish testnet Identity + Reputation mappings
+    // but NOT a testnet Validation Registry. Do not alias identityRegistry here;
+    // leave unconfigured unless explicitly provided.
+    validationRegistry: process.env.GOAT_TESTNET_VALIDATION_REGISTRY || "",
     evidenceRegistry: getChecksumAddress("0x07F608AFf6d63b68029488b726d895c4Bb593038"),
     agentRegistryId: "eip155:48816:0x556089008Fc0a60cD09390Eca93477ca254A5522",
   },
 };
+
+/**
+ * VRD-2026-009 fix: Verify a configured registry address actually hosts deployed
+ * bytecode on the expected chain before any anchoring is enabled. Returns a
+ * structured result instead of assuming the address is correct.
+ */
+export async function verifyRegistryDeployment(
+  provider: any,
+  address: string,
+  expectedChainId: number,
+  expected?: { codeHash?: string; owner?: string }
+): Promise<{ ok: boolean; reason?: string; chainId?: number; codeSize?: number; codeHash?: string; owner?: string }> {
+  try {
+    if (!address || !/^0x[a-fA-F0-9]{40}$/.test(address)) {
+      return { ok: false, reason: `Invalid registry address: ${address}` };
+    }
+    const net = await provider.getNetwork();
+    const chainId = Number(net.chainId);
+    if (chainId !== expectedChainId) {
+      return { ok: false, reason: `Chain ID mismatch: connected ${chainId}, expected ${expectedChainId}`, chainId };
+    }
+    const code = await provider.getCode(address);
+    if (!code || code === "0x") {
+      return { ok: false, reason: `No contract bytecode at ${address} on chain ${chainId}`, chainId, codeSize: 0 };
+    }
+    const codeHash = ethers.keccak256(code);
+    if (expected?.codeHash && codeHash.toLowerCase() !== expected.codeHash.toLowerCase()) {
+      return { ok: false, reason: `Registry code hash mismatch: got ${codeHash}, expected ${expected.codeHash}`, chainId, codeSize: (code.length - 2) / 2, codeHash };
+    }
+    let owner: string | undefined;
+    if (expected?.owner) {
+      const contract = new ethers.Contract(address, ["function owner() view returns (address)"], provider);
+      const registryOwner = String(await contract.owner());
+      owner = registryOwner;
+      if (registryOwner.toLowerCase() !== ethers.getAddress(expected.owner).toLowerCase()) {
+        return { ok: false, reason: `Registry owner mismatch: got ${registryOwner}, expected ${expected.owner}`, chainId, codeSize: (code.length - 2) / 2, codeHash, owner };
+      }
+    }
+    return { ok: true, chainId, codeSize: (code.length - 2) / 2, codeHash, owner };
+  } catch (e: any) {
+    return { ok: false, reason: `Registry verification error: ${e.message}` };
+  }
+}
 
 export const ERC8004_IDENTITY_ABI = [
   "function register(string agentURI) external returns (uint256)",
@@ -58,12 +106,16 @@ export const ERC8004_VALIDATION_ABI = [
 ];
 
 export const EVIDENCE_REGISTRY_ABI = [
-  "function setAuthorizedSigner(string calldata agentId, address signer) external",
-  "function recordEvidence(string calldata agentId, bytes32 bundleHash, string calldata storageUri) external",
+  "function setEvidenceSigner(string calldata agentId, address signer, bool allowed) external",
+  "function setAnchorer(string calldata agentId, address anchorer, bool allowed) external",
+  "function authorizedEvidenceSigners(bytes32, address) view returns (bool)",
+  "function authorizedAnchorers(bytes32, address) view returns (bool)",
+  "function recordEvidence(string calldata agentId, bytes32 bundleHash, string calldata storageUri, address sessionSigner, uint256 authorizationDeadline, bytes calldata authorizationSignature) external",
   "function isEvidenceRecorded(bytes32 bundleHash) external view returns (bool)",
-  "function getEvidenceRecord(bytes32 bundleHash) external view returns (string memory agentId, bytes32 hash, address sessionSigner, uint256 timestamp, bool exists)",
-  "event AuthorizedSignerSet(string indexed agentId, bytes32 indexed agentIdHash, address indexed signer)",
-  "event EvidenceRecorded(string indexed agentId, bytes32 indexed bundleHash, address indexed sessionSigner, uint256 timestamp, string storageUri)",
+  "function getEvidenceRecord(bytes32 bundleHash) external view returns (tuple(string agentId, bytes32 bundleHash, address sessionSigner, uint256 timestamp, address anchorer, bool exists))",
+  "event EvidenceSignerSet(string indexed agentId, bytes32 indexed agentIdHash, address indexed signer, bool allowed)",
+  "event AnchorerSet(string indexed agentId, bytes32 indexed agentIdHash, address indexed anchorer, bool allowed)",
+  "event EvidenceRecorded(string indexed agentId, bytes32 indexed bundleHash, address indexed sessionSigner, address anchorer, uint256 timestamp, string storageUri)",
 ];
 
 export const EVIDENCE_REGISTRY_BYTECODE = "0x608060405234801561000f575f80fd5b50335f806101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff16021790555061125d8061005c5f395ff3fe608060405234801561000f575f80fd5b506004361061007b575f3560e01c80635e47d214116100595780635e47d214146100ff5780636f2b2059146101335780638da5cb5b14610163578063e08b4761146101815761007b565b806301e647251461007f5780633f2716d1146100b357806340cd27d2146100cf575b5f80fd5b61009960048036038101906100949190610917565b61019d565b6040516100aa959493929190610a4c565b60405180910390f35b6100cd60048036038101906100c89190610b05565b610280565b005b6100e960048036038101906100e49190610917565b6105a4565b6040516100f69190610b96565b60405180910390f35b61011960048036038101906101149190610917565b6105d4565b60405161012a959493929190610a4c565b60405180910390f35b61014d60048036038101906101489190610917565b610737565b60405161015a9190610baf565b60405180910390f35b61016b610760565b6040516101789190610b96565b60405180910390f35b61019b60048036038101906101969190610bf2565b610783565b005b6002602052805f5260405f205f91509050805f0180546101bc90610c7c565b80601f01602080910402602001604051908101604052809291908181526020018280546101e890610c7c565b80156102335780601f1061020a57610100808354040283529160200191610233565b820191905f5260205f20905b81548152906001019060200180831161021657829003601f168201915b505050505090806001015490806002015f9054906101000a900473ffffffffffffffffffffffffffffffffffffffff1690806003015490806004015f9054906101000a900460ff16905085565b5f8585604051610291929190610ce8565b604051809103902090505f60015f8381526020019081526020015f205f9054906101000a900473ffffffffffffffffffffffffffffffffffffffff1690505f73ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff160361033d576040517f08c379a000000000000000000000000000000000000000000000000000000000815260040161033490610d70565b60405180910390fd5b8073ffffffffffffffffffffffffffffffffffffffff163373ffffffffffffffffffffffffffffffffffffffff16146103ab576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004016103a290610dfe565b60405180910390fd5b60025f8681526020019081526020015f206004015f9054906101000a900460ff161561040c576040517f08c379a000000000000000000000000000000000000000000000000000000000815260040161040390610e66565b60405180910390fd5b6040518060a0016040528088888080601f0160208091040260200160405190810160405280939291908181526020018383808284375f81840152601f19601f8201169050808301925050505050505081526020018681526020013373ffffffffffffffffffffffffffffffffffffffff1681526020014281526020016001151581525060025f8781526020019081526020015f205f820151815f0190816104b3919061104e565b50602082015181600101556040820151816002015f6101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff160217905550606082015181600301556080820151816004015f6101000a81548160ff0219169083151502179055509050503373ffffffffffffffffffffffffffffffffffffffff1685888860405161055892919061114b565b60405180910390207f9d11d25025a758b6d6fc5c14d69c87c91398681c9b58e91e4b391b2c448321a14288886040516105939392919061118f565b60405180910390a450505050505050565b6001602052805f5260405f205f915054906101000a900473ffffffffffffffffffffffffffffffffffffffff1681565b60605f805f805f60025f8881526020019081526020015f206040518060a00160405290815f8201805461060690610c7c565b80601f016020809104026020016040519081016040528092919081815260200182805461063290610c7c565b801561067d5780601f1061065457610100808354040283529160200191610233565b820191905f5260205f20905b81548152906001019060200180831161021657829003601f168201915b505050505090806001015490806002015f9054906101000a900473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16815260200160038201548152602001600482015f9054906101000a900460ff1615151515815250509050805f01518160200151826040015183606001518460800151955095509550955095505091939590929450565b5f60025f8381526020019081526020015f206004015f9054906101000a900460ff169050919050565b5f8054906101000a900473ffffffffffffffffffffffffffffffffffffffff1681565b5f8054906101000a900473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff163373ffffffffffffffffffffffffffffffffffffffff1614610810576040517f08c379a000000000000000000000000000000000000000000000000000000000815260040161080790611209565b60405180910390fd5b5f8383604051610821929190610ce8565b604051809103902090508160015f8381526020019081526020015f205f6101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055508173ffffffffffffffffffffffffffffffffffffffff168185856040516108a292919061114b565b60405180910390207f8b4ce089761ae739289dc833ddc1a0127b93eced32177dded77a6181a086104460405160405180910390a450505050565b5f80fd5b5f80fd5b5f819050919050565b6108f6816108e4565b8114610900575f80fd5b50565b5f81359050610911816108ed565b92915050565b5f6020828403121561092c5761092b6108dc565b5b5f61093984828501610903565b91505092915050565b5f81519050919050565b5f82825260208201905092915050565b5f5b8381101561097957808201518184015260208101905061095e565b5f8484015250505050565b5f601f19601f8301169050919050565b5f61099e82610942565b6109a8818561094c565b93506109b881856020860161095c565b6109c181610984565b840191505092915050565b6109d5816108e4565b82525050565b5f73ffffffffffffffffffffffffffffffffffffffff82169050919050565b5f610a04826109db565b9050919050565b610a14816109fa565b82525050565b5f819050919050565b610a2c81610a1a565b82525050565b5f8115159050919050565b610a4681610a32565b82525050565b5f60a0820190508181035f830152610a648188610994565b9050610a7360208301876109cc565b610a806040830186610a0b565b610a8d6060830185610a23565b610a9a6080830184610a3d565b9695505050505050565b5f80fd5b5f80fd5b5f80fd5b5f8083601f840112610ac557610ac4610aa4565b5b8235905067ffffffffffffffff811115610ae257610ae1610aa8565b5b602083019150836001820283011115610afe57610afd610aac565b5b9250929050565b5f805f805f60608688031215610b1e57610b1d6108dc565b5b5f86013567ffffffffffffffff811115610b3b57610b3a6108e0565b5b610b4788828901610ab0565b95509550506020610b5a88828901610903565b935050604086013567ffffffffffffffff811115610b7b57610b7a6108e0565b5b610b8788828901610ab0565b92509250509295509295909350565b5f602082019050610ba95f830184610a0b565b92915050565b5f602082019050610bc25f830184610a3d565b92915050565b610bd1816109fa565b8114610bdb575f80fd5b50565b5f81359050610bec81610bc8565b92915050565b5f805f60408486031215610c0957610c086108dc565b5b5f84013567ffffffffffffffff811115610c2657610c256108e0565b5b610c3286828701610ab0565b93509350506020610c4586828701610bde565b9150509250925092565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52602260045260245ffd5b5f6002820490506001821680610c9357607f821691505b602082108103610ca657610ca5610c4f565b5b50919050565b5f81905092915050565b828183375f83830152505050565b5f610ccf8385610cac565b9350610cdc838584610cb6565b82840190509392505050565b5f610cf4828486610cc4565b91508190509392505050565b7f4e6f20617574686f72697a6564207369676e65722073657420666f72206167655f8201527f6e74000000000000000000000000000000000000000000000000000000000000602082015250565b5f610d5a60228361094c565b9150610d6582610d00565b604082019050919050565b5f6020820190508181035f830152610d8781610d4e565b9050919050565b7f43616c6c6572206973206e6f7420617574686f72697a6564207369676e6572205f8201527f666f72206167656e740000000000000000000000000000000000000000000000602082015250565b5f610de860298361094c565b9150610df382610d8e565b604082019050919050565b5f6020820190508181035f830152610e1581610ddc565b9050919050565b7f45766964656e63652062756e646c6520616c7265616479207265636f726465645f82015250565b5f610e5060208361094c565b9150610e5b82610e1c565b602082019050919050565b5f6020820190508181035f830152610e7d81610e44565b9050919050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52604160045260245ffd5b5f819050815f5260205f209050919050565b5f6020601f8301049050919050565b5f82821b905092915050565b5f60088302610f0d7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff82610ed2565b610f178683610ed2565b95508019841693508086168417925050509392505050565b5f819050919050565b5f610f52610f4d610f4884610a1a565b610f2f565b610a1a565b9050919050565b5f819050919050565b610f6b83610f38565b610f7f610f7782610f59565b848454610ede565b825550505050565b5f90565b610f93610f87565b610f9e818484610f62565b505050565b5b81811015610fc157610fb65f82610f8b565b600181019050610fa4565b5050565b601f82111561100657610fd781610eb1565b610fe084610ec3565b81016020851015610fef578190505b611003610ffb85610ec3565b830182610fa3565b50505b505050565b5f82821c905092915050565b5f6110265f198460080261100b565b1980831691505092915050565b5f61103e8383611017565b9150826002028217905092915050565b61105782610942565b67ffffffffffffffff8111156110705761106f610e84565b5b61107a8254610c7c565b611085828285610fc5565b5f60209050601f8311600181146110b6575f84156110a4578287015190505b6110ae8582611033565b865550611115565b601f1984166110c486610eb1565b5f5b828110156110eb578489015182556001820191506020850194506020810190506110c6565b868310156111085784890151611104601f891682611017565b8355505b6001600288020188555050505b505050505050565b5f81905092915050565b5f611132838561111d565b935061113f838584610cb6565b82840190509392505050565b5f611157828486611127565b91508190509392505050565b5f61116e838561094c565b935061117b838584610cb6565b61118483610984565b840190509392505050565b5f6040820190506111a25f830186610a23565b81810360208301526111b5818486611163565b9050949350505050565b7f4f6e6c79206f776e65722063616e2063616c6c207468697300000000000000005f82015250565b5f6111f360188361094c565b91506111fe826111bf565b602082019050919050565b5f6020820190508181035f830152611220816111e7565b905091905056fea2646970667358221220c28eadb66e0cb75a292bd659267f08f7e7fd9cc816ffbe201ccbcd0fb3b384fe64736f6c63430008140033";
@@ -75,6 +127,16 @@ export const EVIDENCE_REGISTRY_BYTECODE = "0x608060405234801561000f575f80fd5b503
 export async function deployEvidenceRegistry(
   signer: any
 ): Promise<{ address: string; txHash: string; contract: ethers.Contract }> {
+  // The embedded bytecode is the legacy v1 single-authority registry. Do not
+  // deploy it after adopting the v2 split-authority ABI above. Deployment is
+  // intentionally performed from a compiled, reviewed Solidity artifact so
+  // the code hash can be pinned in EVIDENCE_REGISTRY_CODE_HASH before startup.
+  throw new Error(
+    "EvidenceRegistry v2 deployment requires the reviewed contracts/EvidenceRegistry.sol artifact; " +
+    "the legacy embedded bytecode is disabled. Pin and verify the deployed runtime code hash before enabling anchoring."
+  );
+
+  /* c8 ignore start -- retained below only to avoid a breaking source export */
   let maxPriorityFeePerGas: bigint = ethers.parseUnits("0.00013", "gwei");
   let maxFeePerGas: bigint = ethers.parseUnits("0.00014", "gwei");
 
@@ -106,9 +168,10 @@ export async function deployEvidenceRegistry(
   const address = await contract.getAddress();
   return {
     address,
-    txHash: tx ? tx.hash : "",
+    txHash: tx?.hash || "",
     contract,
   };
+  /* c8 ignore stop */
 }
 
 export interface ERC8004RegistrationJSON {
@@ -204,7 +267,11 @@ export class GoatERC8004Client {
     const config = GOAT_ERC8004_ADDRESSES[network];
     this.identityContract = new ethers.Contract(config.identityRegistry, ERC8004_IDENTITY_ABI, signerOrProvider);
     this.reputationContract = new ethers.Contract(config.reputationRegistry, ERC8004_REPUTATION_ABI, signerOrProvider);
-    this.validationContract = new ethers.Contract(config.validationRegistry, ERC8004_VALIDATION_ABI, signerOrProvider);
+    // VRD-2026-009 fix: only instantiate the validation registry when an address
+    // is actually configured; do not point it at an unrelated registry.
+    this.validationContract = config.validationRegistry
+      ? new ethers.Contract(config.validationRegistry, ERC8004_VALIDATION_ABI, signerOrProvider)
+      : undefined;
 
     const evidenceAddr = customEvidenceRegistryAddress || config.evidenceRegistry;
     if (evidenceAddr && evidenceAddr !== "0x0000000000000000000000000000000000000000") {
@@ -239,7 +306,10 @@ export class GoatERC8004Client {
     agentId: string;
     bundleHash: string;
     storageUri?: string;
-  }): Promise<string> {
+    sessionSigner: string;
+    authorizationDeadline: number;
+    authorizationSignature: string;
+  }): Promise<{ status: "anchored"; txHash: string; bundleHash: string } | { status: "already-anchored"; bundleHash: string }> {
     if (!this.evidenceContract) {
       throw new Error("EvidenceRegistry contract address not configured for this network");
     }
@@ -250,7 +320,7 @@ export class GoatERC8004Client {
     const alreadyRecorded = await this.isEvidenceRecordedOnChain(hashBytes32).catch(() => false);
     if (alreadyRecorded) {
       console.log(`[GOAT ERC-8004] Bundle hash ${hashBytes32} already recorded on-chain.`);
-      return hashBytes32;
+      return { status: "already-anchored", bundleHash: hashBytes32 };
     }
 
     const targetAddress = await this.evidenceContract.getAddress();
@@ -258,7 +328,10 @@ export class GoatERC8004Client {
     const encodedData = iface.encodeFunctionData("recordEvidence", [
       params.agentId,
       hashBytes32,
-      params.storageUri || ""
+      params.storageUri || "",
+      params.sessionSigner,
+      params.authorizationDeadline,
+      params.authorizationSignature,
     ]);
 
     let tx;
@@ -273,12 +346,15 @@ export class GoatERC8004Client {
         params.agentId,
         hashBytes32,
         params.storageUri || "",
+        params.sessionSigner,
+        params.authorizationDeadline,
+        params.authorizationSignature,
         { gasLimit: 300000 }
       );
     }
 
     const receipt = await tx.wait();
-    return receipt ? receipt.hash : tx.hash;
+    return { status: "anchored", txHash: receipt ? receipt.hash : tx.hash, bundleHash: hashBytes32 };
   }
 
   /**
@@ -352,6 +428,9 @@ export class GoatERC8004Client {
     requestURI: string;
     requestHash: string;
   }): Promise<string> {
+    if (!this.validationContract) {
+      throw new Error("Validation Registry is not configured for this network");
+    }
     const tx = await this.validationContract.validationRequest(
       params.validatorAddress,
       params.agentId,
@@ -372,6 +451,9 @@ export class GoatERC8004Client {
     responseHash?: string;
     tag?: string;
   }): Promise<string> {
+    if (!this.validationContract) {
+      throw new Error("Validation Registry is not configured for this network");
+    }
     const tx = await this.validationContract.validationResponse(
       params.requestHash,
       params.response,

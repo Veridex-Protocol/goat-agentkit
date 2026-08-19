@@ -1,10 +1,30 @@
-import { Wallet, getBytes, TypedDataDomain, TypedDataField } from "ethers";
+import { Wallet, id, TypedDataDomain, TypedDataField } from "ethers";
 import { EvidenceBundle } from "./builder.js";
 
 export interface SessionSigner {
   getAddress(): Promise<string>;
   signBundle(bundle: EvidenceBundle): Promise<EvidenceBundle>;
+  signEvidenceAuthorization(params: EvidenceAuthorization): Promise<string>;
 }
+
+/** EIP-712 delegation consumed by EvidenceRegistry v2 when a relayer anchors a bundle. */
+export interface EvidenceAuthorization {
+  agentId: string;
+  bundleHash: string;
+  sessionSigner: string;
+  deadline: number;
+  chainId: number;
+  verifyingContract: string;
+}
+
+export const EVIDENCE_AUTHORIZATION_TYPES: Record<string, TypedDataField[]> = {
+  EvidenceAuthorization: [
+    { name: "agentHash", type: "bytes32" },
+    { name: "bundleHash", type: "bytes32" },
+    { name: "sessionSigner", type: "address" },
+    { name: "deadline", type: "uint256" },
+  ],
+};
 
 // EIP-712 domain for evidence bundle signatures (VD-GOAT-003 fix)
 const EVIDENCE_BUNDLE_DOMAIN: TypedDataDomain = {
@@ -79,5 +99,33 @@ export class LocalSessionSigner implements SessionSigner {
 
     bundle.signature = signature;
     return bundle;
+  }
+
+  public async signEvidenceAuthorization(params: EvidenceAuthorization): Promise<string> {
+    const expectedAddress = await this.getAddress();
+    if (expectedAddress.toLowerCase() !== params.sessionSigner.toLowerCase()) {
+      throw new Error("Evidence authorization must be signed by the declared session signer");
+    }
+    if (!/^0x[0-9a-fA-F]{64}$/.test(params.bundleHash)) {
+      throw new Error("Evidence authorization bundleHash must be a bytes32 value");
+    }
+    if (!Number.isSafeInteger(params.deadline) || params.deadline <= Math.floor(Date.now() / 1000)) {
+      throw new Error("Evidence authorization deadline must be a future Unix timestamp");
+    }
+    return this.wallet.signTypedData(
+      {
+        name: "Veridex Evidence Registry",
+        version: "2",
+        chainId: params.chainId,
+        verifyingContract: params.verifyingContract,
+      },
+      EVIDENCE_AUTHORIZATION_TYPES,
+      {
+        agentHash: id(params.agentId),
+        bundleHash: params.bundleHash,
+        sessionSigner: params.sessionSigner,
+        deadline: params.deadline,
+      },
+    );
   }
 }

@@ -6,6 +6,7 @@
 
 import { SignedStateFile } from "../utils/atomicFile.js";
 import * as path from "path";
+import { Pool, type PoolConfig } from "pg";
 
 export interface RevokedSession {
   address: string;
@@ -19,10 +20,16 @@ export interface RevocationListState {
   lastCleanup: number;
 }
 
+/** A revocation backend may be synchronous (development file) or durable. */
+export interface SessionRevocationProvider {
+  revoke(address: string, reason?: string, agentId?: string): void | Promise<void>;
+  isRevoked(address: string, agentId?: string): boolean | Promise<boolean>;
+}
+
 /**
  * Session revocation list with persistence and automatic cleanup.
  */
-export class SessionRevocationList {
+export class SessionRevocationList implements SessionRevocationProvider {
   private stateFile: SignedStateFile<RevocationListState>;
   private cache: Map<string, RevokedSession> = new Map();
   private maxAge: number;
@@ -150,6 +157,75 @@ export class SessionRevocationList {
   public clear(): void {
     this.cache.clear();
     this.save();
+  }
+}
+
+/**
+ * Transactional revocation backend for multi-replica deployments. Database
+ * failures propagate to callers so a wallet operation fails closed instead of
+ * trusting a stale in-process cache.
+ */
+export class PostgresSessionRevocationProvider implements SessionRevocationProvider {
+  private readonly pool: Pool;
+  private readonly namespace: string;
+  private schemaReady?: Promise<void>;
+
+  constructor(connection: string | PoolConfig, namespace: string) {
+    if (!namespace || namespace.length > 200) throw new Error("revocation namespace must be 1-200 characters");
+    this.pool = new Pool(typeof connection === "string" ? { connectionString: connection } : connection);
+    this.namespace = namespace;
+  }
+
+  private async ensureSchema(): Promise<void> {
+    if (!this.schemaReady) {
+      this.schemaReady = this.pool.query(`
+        CREATE TABLE IF NOT EXISTS veridex_session_revocations (
+          namespace TEXT NOT NULL,
+          agent_id TEXT NOT NULL,
+          session_address TEXT NOT NULL,
+          revoked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          reason TEXT,
+          PRIMARY KEY (namespace, agent_id, session_address)
+        );
+        CREATE INDEX IF NOT EXISTS veridex_session_revocations_lookup_idx
+          ON veridex_session_revocations (namespace, agent_id, session_address);
+      `).then(() => undefined).catch((error) => {
+        this.schemaReady = undefined;
+        throw error;
+      });
+    }
+    await this.schemaReady;
+  }
+
+  private normalized(address: string): string {
+    if (!/^0x[a-fA-F0-9]{40}$/.test(address)) throw new Error("revoked session address must be an EVM address");
+    return address.toLowerCase();
+  }
+
+  public async revoke(address: string, reason?: string, agentId?: string): Promise<void> {
+    if (!agentId || agentId.length > 300) throw new Error("agentId is required for durable session revocation");
+    await this.ensureSchema();
+    await this.pool.query(
+      `INSERT INTO veridex_session_revocations (namespace, agent_id, session_address, reason)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (namespace, agent_id, session_address) DO NOTHING`,
+      [this.namespace, agentId, this.normalized(address), reason?.slice(0, 1024) || null],
+    );
+  }
+
+  public async isRevoked(address: string, agentId?: string): Promise<boolean> {
+    if (!agentId || agentId.length > 300) throw new Error("agentId is required for durable session revocation");
+    await this.ensureSchema();
+    const result = await this.pool.query(
+      `SELECT 1 FROM veridex_session_revocations
+       WHERE namespace = $1 AND agent_id = $2 AND session_address = $3 LIMIT 1`,
+      [this.namespace, agentId, this.normalized(address)],
+    );
+    return result.rowCount === 1;
+  }
+
+  public async close(): Promise<void> {
+    await this.pool.end();
   }
 }
 

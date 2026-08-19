@@ -1,10 +1,12 @@
 import { ethers } from "ethers";
-import { VeridexPolicyGate } from "./policy/gate.js";
+import { VeridexPolicyGate, type PolicyStateProvider } from "./policy/gate.js";
 import { PolicyRuleConfig } from "./policy/rules.js";
 import { EvidenceBuilder } from "./evidence/builder.js";
 import { LocalSessionSigner, SessionSigner } from "./evidence/signer.js";
 import { AzureMaaAttestation } from "./attestation/azureMaa.js";
-import { getGlobalRevocationList } from "./session/revocation.js";
+import { getGlobalRevocationList, type SessionRevocationProvider } from "./session/revocation.js";
+import { assertExecutionMatchesNormalizedAction } from "./policy/decoder.js";
+import type { NormalizedAction } from "./types/action.js";
 
 export interface VeridexGoatConfig {
   agentId: string; // e.g. "erc8004:48816:1042"
@@ -13,6 +15,10 @@ export interface VeridexGoatConfig {
   teeAttestationEnabled?: boolean;
   onBundleEmitted?: (bundle: any) => void;
   expiresAt?: number;
+  /** Required for multi-replica production enforcement; use PostgresPolicyStateProvider. */
+  policyStateProvider?: PolicyStateProvider;
+  /** Required for multi-replica session revocation; use PostgresSessionRevocationProvider. */
+  sessionRevocationProvider?: SessionRevocationProvider;
 }
 
 export interface SessionCreationOptions {
@@ -91,7 +97,8 @@ export function wrapWalletAdapter(
   underlyingAdapter: any,
   config: VeridexGoatConfig
 ): any {
-  const policyGate = new VeridexPolicyGate(config.policyRules);
+  const policyGate = new VeridexPolicyGate(config.policyRules, config.policyStateProvider);
+  const sessionRevocations = config.sessionRevocationProvider || getGlobalRevocationList();
   let activeSessionSigner = config.sessionSigner || new LocalSessionSigner();
   let sessionExpiresAt: number | undefined = config.expiresAt;
 
@@ -124,18 +131,16 @@ export function wrapWalletAdapter(
       // VD-GOAT-012 fix: Session revocation API
       if (prop === "__revokeSession") {
         return async (address?: string, reason?: string) => {
-          const revocationList = getGlobalRevocationList();
           const targetAddr = address || (await activeSessionSigner.getAddress());
-          revocationList.revoke(targetAddr, reason, config.agentId);
+          await sessionRevocations.revoke(targetAddr, reason, config.agentId);
           return { revoked: targetAddr, at: Date.now() };
         };
       }
 
       if (prop === "__isSessionRevoked") {
         return async (address?: string) => {
-          const revocationList = getGlobalRevocationList();
           const targetAddr = address || (await activeSessionSigner.getAddress());
-          return revocationList.isRevoked(targetAddr);
+          return sessionRevocations.isRevoked(targetAddr, config.agentId);
         };
       }
 
@@ -150,8 +155,7 @@ export function wrapWalletAdapter(
           // VD-GOAT-012 fix: Check session revocation
           const sessionAddr = await activeSessionSigner.getAddress().catch(() => null);
           if (sessionAddr) {
-            const revocationList = getGlobalRevocationList();
-            if (revocationList.isRevoked(sessionAddr)) {
+            if (await sessionRevocations.isRevoked(sessionAddr, config.agentId)) {
               throw new Error(
                 `[Veridex Session Error] Session key ${sessionAddr} has been revoked and cannot be used`
               );
@@ -159,6 +163,18 @@ export function wrapWalletAdapter(
           }
 
           const txPayload = args[0] || {};
+
+          // A raw amountUSD is only an assertion supplied by the caller; it is
+          // never sufficient to authorize a value-bearing operation. The exact
+          // transaction must be bound to the immutable normalized action.
+          const boundAction: NormalizedAction | undefined =
+            txPayload?._normalizedAction || args[3]?._normalizedAction;
+
+          if (prop === "signMessage") {
+            throw new Error(
+              "[Veridex Wallet Adapter] signMessage is disabled: an arbitrary personal signature cannot be bound to a normalized economic action."
+            );
+          }
 
           // VD-GOAT-006 fix: Handle different signing method types
           let recipient = txPayload.to || txPayload.recipient || "0x0000000000000000000000000000000000000000";
@@ -214,7 +230,7 @@ export function wrapWalletAdapter(
             }
           }
 
-          // VD-GOAT-006 fix: Require amountUSD for all value-bearing operations
+          // Value-bearing methods must have one immutable normalized action.
           const VALUE_BEARING_METHODS = [
             "sendTransaction",
             "signTransaction",
@@ -229,10 +245,38 @@ export function wrapWalletAdapter(
             "permit2",
           ];
 
-          const amountUSD = txPayload.amountUSD || args[3]?.amountUSD; // Check both payload and options
-          if (amountUSD === undefined && VALUE_BEARING_METHODS.includes(prop as string)) {
-            throw new Error("[Veridex Wallet Adapter] Cannot determine transaction USD value: amountUSD must be explicitly provided in transaction payload.");
+          if (VALUE_BEARING_METHODS.includes(prop as string)) {
+            if (!boundAction) {
+              throw new Error(
+                "[Veridex Wallet Adapter] Unbound value-bearing operation rejected. Supply an immutable _normalizedAction; amountUSD alone is not trusted."
+              );
+            }
+
+            // Direct message and typed-data signing can grant authority that is
+            // not representable by this transfer-only action type. Disable them
+            // until they have their own exact normalizers.
+            if (["signMessage", "signTypedData", "_signTypedData", "sendUserOperation", "signUserOperation", "permit", "permit2", "writeContract"].includes(prop as string)) {
+              throw new Error(
+                `[Veridex Wallet Adapter] ${String(prop)} is disabled until an exact normalized action type is implemented for it.`
+              );
+            }
+
+            if (["sendTransaction", "signTransaction", "transfer", "sendRawTransaction"].includes(prop as string)) {
+              assertExecutionMatchesNormalizedAction(boundAction, txPayload);
+            }
+
+            if (chain !== boundAction.chainId) {
+              throw new Error(
+                `[Veridex Wallet Adapter] ACTION_BINDING_ERROR: adapter chain ${chain} does not match normalized chain ${boundAction.chainId}`
+              );
+            }
+
+            recipient = boundAction.to;
+            amount = boundAction.value;
+            asset = boundAction.symbol;
           }
+
+          const amountUSD = boundAction?.usdValue;
 
           if (amountUSD !== undefined) {
             const sessionAddr = await activeSessionSigner.getAddress();
@@ -249,16 +293,18 @@ export function wrapWalletAdapter(
               metadata: { method: prop, txPayload },
             });
 
-            // 1b. Atomic Budget Reservation (VD-GOAT-005 fix)
-            const actionId = ethers.id(`${chain}:${recipient}:${amount}:${Date.now()}`);
-            const reservationSuccess = policyGate.reserve(actionId, amountUSD);
+            // 1b. Atomic Budget Reservation. The action identifier is generated
+            // by the normalizer and is stable across retries, so replay handling
+            // is durable rather than Date.now()-based.
+            const actionId = boundAction!.actionId;
+            const reservationSuccess = await policyGate.reserve(actionId, amountUSD);
             if (!reservationSuccess) {
               throw new Error(`[Veridex Policy Denial] Budget reservation failed: would exceed daily limit`);
             }
 
             // 2. Pre-Signature Enforcement Gate: Denial
             if (evaluation.verdict === "deny") {
-              policyGate.releaseReservation(actionId);
+              await policyGate.releaseReservation(actionId);
               const denialBundle = evidenceBuilder.buildDenial({
                 payload: { to: recipient, amount, asset, chain },
                 evaluation,
@@ -272,7 +318,7 @@ export function wrapWalletAdapter(
 
             // 2b. Pre-Signature Enforcement Gate: Escalation
             if (evaluation.verdict === "escalate") {
-              policyGate.releaseReservation(actionId);
+              await policyGate.releaseReservation(actionId);
               const escalationBundle = evidenceBuilder.buildDenial({
                 payload: { to: recipient, amount, asset, chain },
                 evaluation,
@@ -287,24 +333,30 @@ export function wrapWalletAdapter(
               );
             }
 
-            // 3. TEE Attestation Quote Fetch (If enabled)
-            let teeAttestation;
-            if (config.teeAttestationEnabled && evaluation.traceHash) {
-              teeAttestation = await AzureMaaAttestation.getQuote(evaluation.traceHash);
-            }
+            let committed = false;
+            try {
+              // 3. TEE Attestation Quote Fetch (If enabled)
+              let teeAttestation;
+              if (config.teeAttestationEnabled && evaluation.traceHash) {
+                teeAttestation = await AzureMaaAttestation.getQuote(evaluation.traceHash);
+              }
 
-            // 4. Delegate Execution to Underlying Wallet Adapter
-            let result;
-            if (typeof target[prop] === "function") {
-              result = await target[prop](...args);
-            } else {
-              throw new Error(`Underlying wallet adapter function '${String(prop)}' is not invokable`);
-            }
+              // 4. Delegate Execution to Underlying Wallet Adapter
+              let result;
+              if (typeof target[prop] === "function") {
+                result = await target[prop](...args);
+              } else {
+                throw new Error(`Underlying wallet adapter function '${String(prop)}' is not invokable`);
+              }
 
-            const txHash = typeof result === "string" ? result : result?.hash;
-            if (txHash) {
+              const txHash = typeof result === "string" ? result : result?.hash;
+              if (!txHash) {
+                throw new Error("[Veridex Wallet Adapter] Underlying operation returned no transaction hash");
+              }
+
               // Commit policy limits now that transaction has successfully broadcasted (VD-GOAT-005 fix)
-              policyGate.commit(amountUSD, evaluation.evaluatedAt, actionId);
+              await policyGate.commit(amountUSD, evaluation.evaluatedAt, actionId);
+              committed = true;
 
               // 5. Build & Sign Complete Evidence Bundle
               const bundle = evidenceBuilder.buildSuccess({
@@ -318,9 +370,12 @@ export function wrapWalletAdapter(
               if (config.onBundleEmitted) {
                 config.onBundleEmitted(signedBundle);
               }
+              return result;
+            } finally {
+              if (!committed) {
+                await policyGate.releaseReservation(actionId);
+              }
             }
-
-            return result;
           }
 
           if (typeof target[prop] === "function") {

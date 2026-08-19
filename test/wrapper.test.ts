@@ -8,6 +8,7 @@ import {
   LocalSessionSigner,
 } from "../src/index.js";
 import * as fs from "fs";
+import { ethers } from "ethers";
 
 describe("@veridex/goat-agentkit", () => {
   const policyRules = {
@@ -57,11 +58,18 @@ describe("@veridex/goat-agentkit", () => {
       },
     });
 
+    const normalizedAction: any = Object.freeze({
+      actionId: ethers.id("rotation-test-action"), chainId: 30,
+      from: "0x2222222222222222222222222222222222222222",
+      to: "0x1111111111111111111111111111111111111111", value: 2500000n,
+      assetType: "native", symbol: "USDC", tokenAddress: null, calldataSelector: "0x00000000",
+      decimals: 6, priceUSD: 1, usdValue: 2.5,
+    });
+
     await wrappedWallet.sendTransaction({
       to: "0x1111111111111111111111111111111111111111",
-      value: 2.5,
-      amountUSD: 2.5,
-      asset: "USDC",
+      value: 2500000n,
+      _normalizedAction: normalizedAction,
     });
 
     expect(EvidenceBuilder.verifyBundle(emittedBundle).recoveredAddress).toBe(session1.sessionAddress);
@@ -77,9 +85,8 @@ describe("@veridex/goat-agentkit", () => {
 
     await wrappedWallet.sendTransaction({
       to: "0x1111111111111111111111111111111111111111",
-      value: 2.5,
-      amountUSD: 2.5,
-      asset: "USDC",
+      value: 2500000n,
+      _normalizedAction: { ...normalizedAction, actionId: ethers.id("rotation-test-action-2") },
     });
 
 

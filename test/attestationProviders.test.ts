@@ -15,7 +15,7 @@ describe("Confidential Compute & TEE Attestation Drivers (Live Specification)", 
     expect(provider.getType()).toBe("azure-maa/sev-snp");
 
     const report = await provider.getAttestationReport(sampleTraceHash);
-    expect(report.provider).toBe("azure-maa/sev-snp");
+    expect(["azure-maa/sev-snp", "azure-maa/sev-snp-unverified", "software"]).toContain(report.provider);
     expect(report.boundHash).toBeDefined();
     expect(report.quote).toBeDefined();
   });
@@ -25,7 +25,9 @@ describe("Confidential Compute & TEE Attestation Drivers (Live Specification)", 
     expect(provider.getType()).toBe("aws-nitro-enclave");
 
     const report = await provider.getAttestationReport(sampleTraceHash);
-    expect(report.provider).toBe("aws-nitro-enclave");
+    // Outside an actual Nitro enclave the driver returns provider:"software" to avoid
+    // emitting plausible-looking hardware attestations from a non-TEE environment.
+    expect(["aws-nitro-enclave", "software"]).toContain(report.provider);
     expect(report.measurement).toBeDefined();
     expect(report.boundHash).toBeDefined();
   });
@@ -35,7 +37,8 @@ describe("Confidential Compute & TEE Attestation Drivers (Live Specification)", 
     expect(provider.getType()).toBe("phala-dstack");
 
     const report = await provider.getAttestationReport(sampleTraceHash);
-    expect(report.provider).toBe("phala-dstack");
+    expect(["phala-dstack", "software"]).toContain(report.provider);
+    expect(report.verified).toBe(false);
     expect(report.quote).toBeDefined();
   });
 
@@ -44,7 +47,8 @@ describe("Confidential Compute & TEE Attestation Drivers (Live Specification)", 
     expect(provider.getType()).toBe("nillion-secret-vault");
 
     const report = await provider.getAttestationReport(sampleTraceHash);
-    expect(report.provider).toBe("nillion-secret-vault");
+    expect(["nillion-secret-vault", "software"]).toContain(report.provider);
+    expect(report.verified).toBe(false);
     expect(report.quote).toBeDefined();
   });
 
