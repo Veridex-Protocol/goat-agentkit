@@ -44,6 +44,14 @@ export function createDefaultPolicyState(): PolicyState {
   };
 }
 
+function usdMicros(value: number, label: string): number {
+  const micros = Math.round(value * 1_000_000);
+  if (!Number.isSafeInteger(micros) || micros < 0) {
+    throw new Error(`${label} is outside the exact USD policy range`);
+  }
+  return micros;
+}
+
 export function sanitizePolicyState(value: Partial<PolicyState> | undefined): PolicyState {
   const fallback = createDefaultPolicyState();
   if (!value || typeof value !== "object") return fallback;
@@ -222,6 +230,7 @@ export class VeridexPolicyGate {
       throw new Error("INVALID_RESERVATION: actionId and amountUSD are invalid.");
     }
     return this.mutate(() => {
+      const now = Date.now();
       const currentDay = Math.floor(Date.now() / 86400000);
       if (currentDay !== this.lastSpendResetDay) {
         this.dailySpendUSD = 0;
@@ -230,10 +239,26 @@ export class VeridexPolicyGate {
       if (this.processedActionIds.has(actionId) || this.reservedActionIds.has(actionId)) {
         throw new Error(`DUPLICATE_ACTION: Action ${actionId} has already been processed or is in flight.`);
       }
-      if (this.config.spendingLimits && this.dailySpendUSD + amountUSD > this.config.spendingLimits.maxDailyUSD) {
+      if (this.isCircuitBreakerTripped) return false;
+      if (this.config.timeLock &&
+          ((this.lastTxTimestamp > 0 && now - this.lastTxTimestamp < this.config.timeLock.cooldownMs) ||
+           this.reservedActionIds.size > 0)) {
         return false;
       }
-      this.dailySpendUSD += amountUSD;
+      if (this.config.velocityLimit) {
+        const oneHourAgo = now - 3_600_000;
+        this.txTimestamps = this.txTimestamps.filter((timestamp) => timestamp > oneHourAgo);
+        if (this.txTimestamps.length + this.reservedActionIds.size >= this.config.velocityLimit.maxTxPerHour) {
+          return false;
+        }
+      }
+      if (this.config.spendingLimits &&
+          (usdMicros(amountUSD, "Reservation amount") > usdMicros(this.config.spendingLimits.maxPerTxUSD, "Per-transaction cap") ||
+           usdMicros(this.dailySpendUSD, "Daily spend") + usdMicros(amountUSD, "Reservation amount") >
+             usdMicros(this.config.spendingLimits.maxDailyUSD, "Daily cap"))) {
+        return false;
+      }
+      this.dailySpendUSD = (usdMicros(this.dailySpendUSD, "Daily spend") + usdMicros(amountUSD, "Reservation amount")) / 1_000_000;
       this.reservedActionIds.set(actionId, amountUSD);
       return true;
     });
@@ -243,7 +268,10 @@ export class VeridexPolicyGate {
     await this.mutate(() => {
       const reservedAmount = this.reservedActionIds.get(actionId);
       if (reservedAmount !== undefined) {
-        this.dailySpendUSD = Math.max(0, this.dailySpendUSD - reservedAmount);
+        this.dailySpendUSD = Math.max(
+          0,
+          (usdMicros(this.dailySpendUSD, "Daily spend") - usdMicros(reservedAmount, "Reservation amount")) / 1_000_000,
+        );
         this.reservedActionIds.delete(actionId);
       }
     });
@@ -329,8 +357,9 @@ export class VeridexPolicyGate {
     // 3. Spending Limits (Per-Tx & Daily)
     if (this.config.spendingLimits) {
       const { maxPerTxUSD, maxDailyUSD } = this.config.spendingLimits;
-      const perTxPassed = amountUSD <= maxPerTxUSD;
-      const dailyPassed = (this.dailySpendUSD + amountUSD) <= maxDailyUSD;
+      const perTxPassed = usdMicros(amountUSD, "Payment amount") <= usdMicros(maxPerTxUSD, "Per-transaction cap");
+      const dailyPassed = usdMicros(this.dailySpendUSD, "Daily spend") + usdMicros(amountUSD, "Payment amount") <=
+        usdMicros(maxDailyUSD, "Daily cap");
       const passed = perTxPassed && dailyPassed;
 
       let reason = `USD $${amountUSD.toFixed(2)} within per-tx $${maxPerTxUSD} and daily $${maxDailyUSD} (spent today $${this.dailySpendUSD.toFixed(2)})`;
@@ -440,7 +469,7 @@ export class VeridexPolicyGate {
         this.reservedActionIds.delete(actionId);
         this.processedActionIds.add(actionId);
       } else {
-        this.dailySpendUSD += amountUSD;
+        this.dailySpendUSD = (usdMicros(this.dailySpendUSD, "Daily spend") + usdMicros(amountUSD, "Commit amount")) / 1_000_000;
         if (actionId) this.processedActionIds.add(actionId);
       }
       this.lastTxTimestamp = evaluatedAt;

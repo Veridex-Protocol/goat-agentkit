@@ -1,6 +1,6 @@
 import { keccak256, toUtf8Bytes } from "ethers";
 import fs from "fs";
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 import { createVerify, X509Certificate } from "crypto";
 import { AttestationProvider, TEEAttestationReport, TEEProviderType } from "./types.js";
 
@@ -40,6 +40,11 @@ export class AzureMaaAttestationProvider implements AttestationProvider {
 
     // Strategy 1: Live Azure IMDS Guest Attestation Endpoint
     try {
+      const imdsUrl = new URL(this.imdsEndpoint);
+      if (this.requiresVerifiedAttestation() &&
+          (imdsUrl.protocol !== "http:" || imdsUrl.hostname !== "169.254.169.254")) {
+        throw new Error("Verified Azure attestation requires the link-local IMDS endpoint");
+      }
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 2000);
 
@@ -86,7 +91,11 @@ export class AzureMaaAttestationProvider implements AttestationProvider {
     // Strategy 2: Direct Linux Device Driver (/dev/sev-guest)
     try {
       if (fs.existsSync(this.devSevGuestPath)) {
-        const output = execSync(`/usr/bin/azguestattest --user-data ${boundHash} --api-version 2021-01-01`, { stdio: "pipe" });
+        const output = execFileSync(
+          "/usr/bin/azguestattest",
+          ["--user-data", boundHash, "--api-version", "2021-01-01"],
+          { stdio: "pipe", timeout: 10_000, maxBuffer: 1_048_576 },
+        );
         const res = JSON.parse(output.toString("utf-8"));
         const hexQuote = res.quote || res.attestationToken || res.token || res.raw_quote;
         const measurement = res.measurement || "0x2b8d4056a1f3e7c9b0d2854f6a9e1c3b7d05f28a4c6e1b9d3f705a2c8f3a1c7e9";
@@ -136,6 +145,7 @@ export class AzureMaaAttestationProvider implements AttestationProvider {
    */
   private parseMaaJwt(jwt: string, expectedBoundHash?: string): { measurement?: string; certChain?: string[]; verified: boolean; error?: string } {
     try {
+      if (jwt.length > 262_144) return { verified: false, error: "Attestation JWT exceeds 256 KiB" };
       const parts = jwt.split(".");
       if (parts.length !== 3) {
         return { verified: false, error: "Invalid JWT format" };
@@ -145,6 +155,12 @@ export class AzureMaaAttestationProvider implements AttestationProvider {
       const payload = JSON.parse(decodeBase64Url(parts[1]));
       const signature = parts[2];
       const strict = this.requiresVerifiedAttestation();
+
+      if (header.x5c !== undefined &&
+          (!Array.isArray(header.x5c) || header.x5c.length < 1 || header.x5c.length > 6 ||
+           header.x5c.some((certificate: unknown) => typeof certificate !== "string" || certificate.length > 32_768))) {
+        return { verified: false, error: "x5c certificate chain is malformed or too large" };
+      }
 
       if (header.alg !== "RS256") {
         return { verified: false, error: `Unexpected JWT algorithm ${header.alg || "(missing)"}` };

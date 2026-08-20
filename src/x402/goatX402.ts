@@ -11,6 +11,22 @@ import { Pool, type PoolConfig } from "pg";
 import type { SessionRevocationProvider } from "../session/revocation.js";
 import type { VerifiedX402Settlement, X402SettlementVerifier } from "./settlement.js";
 
+/**
+ * An adapter throws this only after a transaction hash has been returned by
+ * the network but durable verification/outbox work failed. The policy gate
+ * keeps the reservation for durable reconciliation instead of pretending the
+ * funds were never sent.
+ */
+export class X402BroadcastUncertainError extends Error {
+  public readonly txHash: string;
+
+  constructor(txHash: string, message: string, options?: { cause?: unknown }) {
+    super(`${message} (broadcast transaction ${txHash})`, options);
+    this.name = "X402BroadcastUncertainError";
+    this.txHash = txHash;
+  }
+}
+
 export interface X402Challenge {
   version: "2";
   status: number;
@@ -427,7 +443,7 @@ export function wrapX402PaymentActions(
   policyGate: VeridexPolicyGate,
   sessionSigner?: SessionSigner,
   agentId: string = "erc8004:48816:1042",
-  onBundleEmitted?: (bundle: EvidenceBundle) => void,
+  onBundleEmitted?: (bundle: EvidenceBundle) => void | Promise<void>,
   options?: X402ExecutionSecurity,
 ): ActionDefinition[] {
   const signer = sessionSigner || new LocalSessionSigner();
@@ -506,7 +522,7 @@ export function wrapX402PaymentActions(
           });
           const signedBundle = await signer.signBundle(denialBundle);
           if (onBundleEmitted) {
-            onBundleEmitted(signedBundle);
+            await onBundleEmitted(signedBundle);
           }
 
           return {
@@ -533,7 +549,7 @@ export function wrapX402PaymentActions(
           });
           const signedBundle = await signer.signBundle(escalationBundle);
           if (onBundleEmitted) {
-            onBundleEmitted(signedBundle);
+            await onBundleEmitted(signedBundle);
           }
 
           return {
@@ -574,6 +590,7 @@ export function wrapX402PaymentActions(
           confirmed: options?.settlementNotifier ? false : true,
         };
         let committed = false;
+        let broadcastUncertain = false;
         try {
           result = await action.execute(input, context);
           txHash = typeof result?.txHash === "string" ? result.txHash : result?.settlementReceipt?.txHash;
@@ -605,10 +622,15 @@ export function wrapX402PaymentActions(
               };
             }
           }
+        } catch (error) {
+          if (error instanceof X402BroadcastUncertainError) {
+            broadcastUncertain = true;
+          }
+          throw error;
         } finally {
-          // VRD-2026-007 fix: release the reservation on ANY non-committed exit
-          // (throw, missing hash) so failures never leak budget.
-          if (!committed) {
+          // If broadcast is uncertain, retain the reservation and trip the
+          // breaker until reconciliation proves whether funds moved.
+          if (!committed && !broadcastUncertain) {
             await policyGate.releaseReservation(actionId);
           }
         }
@@ -622,7 +644,7 @@ export function wrapX402PaymentActions(
 
         const signedSuccessBundle = await signer.signBundle(successBundle);
         if (onBundleEmitted) {
-          onBundleEmitted(signedSuccessBundle);
+          await onBundleEmitted(signedSuccessBundle);
         }
 
         return {
@@ -645,14 +667,14 @@ export class VeridexGoatX402Payer {
   private policyGate: VeridexPolicyGate;
   private sessionSigner: SessionSigner;
   private agentId: string;
-  private onBundleEmitted?: (bundle: EvidenceBundle) => void;
+  private onBundleEmitted?: (bundle: EvidenceBundle) => void | Promise<void>;
   private security?: X402ExecutionSecurity;
 
   constructor(params: {
     agentId: string;
     policyRules: PolicyRuleConfig;
     sessionSigner?: SessionSigner;
-    onBundleEmitted?: (bundle: EvidenceBundle) => void;
+    onBundleEmitted?: (bundle: EvidenceBundle) => void | Promise<void>;
     policyStateProvider?: PolicyStateProvider;
     security?: X402ExecutionSecurity;
   }) {
@@ -716,7 +738,7 @@ export class VeridexGoatX402Payer {
 
       const signedDenial = await this.sessionSigner.signBundle(denialBundle);
       if (this.onBundleEmitted) {
-        this.onBundleEmitted(signedDenial);
+        await this.onBundleEmitted(signedDenial);
       }
 
       const error: any = new Error(`[Veridex x402 Policy Denial] Payment blocked: ${evaluation.reasons.join(", ")}`);
@@ -738,7 +760,7 @@ export class VeridexGoatX402Payer {
 
       const signedBundle = await this.sessionSigner.signBundle(escalationBundle);
       if (this.onBundleEmitted) {
-        this.onBundleEmitted(signedBundle);
+        await this.onBundleEmitted(signedBundle);
       }
 
       throw new HumanApprovalRequiredError(
@@ -761,6 +783,7 @@ export class VeridexGoatX402Payer {
       confirmed: verificationOptions?.settlementNotifier || this.security?.settlementNotifier ? false : true,
     };
     let committed = false;
+    let broadcastUncertain = false;
     try {
       if (walletAdapter && typeof walletAdapter.sendTransaction === "function") {
         const execution = TransactionDecoder.buildExecutionRequest(normalizedAction);
@@ -791,8 +814,13 @@ export class VeridexGoatX402Payer {
           merchantConfirmation = { confirmed: false, error: error?.message || "Merchant settlement notification failed" };
         }
       }
+    } catch (error) {
+      if (error instanceof X402BroadcastUncertainError) {
+        broadcastUncertain = true;
+      }
+      throw error;
     } finally {
-      if (!committed) {
+      if (!committed && !broadcastUncertain) {
         await this.policyGate.releaseReservation(actionId);
       }
     }
@@ -810,7 +838,7 @@ export class VeridexGoatX402Payer {
 
     const signedBundle = await this.sessionSigner.signBundle(bundle);
     if (this.onBundleEmitted) {
-      this.onBundleEmitted(signedBundle);
+      await this.onBundleEmitted(signedBundle);
     }
 
     return {

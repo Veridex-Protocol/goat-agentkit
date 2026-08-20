@@ -79,6 +79,7 @@ function providerFor(bound: NormalizedAction, overrides: Record<string, unknown>
     }),
     getTransaction: async () => ({
       hash: txHash,
+      from: bound.from,
       to: bound.assetType === "erc20" ? token : bound.to,
       value: bound.assetType === "erc20" ? 0n : bound.value,
       data,

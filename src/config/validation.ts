@@ -12,11 +12,17 @@ import { GOAT_ERC8004_ADDRESSES } from "../erc8004/goatContracts.js";
 export function validateBootConfiguration(env: Record<string, string | undefined> = process.env): void {
   const isProduction = env.NODE_ENV === "production";
   const errors: string[] = [];
+  const addressPattern = /^0x[a-fA-F0-9]{40}$/;
+  const bytes32Pattern = /^(?:0x)?[a-fA-F0-9]{64}$/;
+  const isPlaceholder = (value: string | undefined) => !value || /REPLACE_WITH|CHANGE_ME|PLACEHOLDER/i.test(value);
 
   // 1. Validate Evidence Registry address
   const registryAddr = env.EVIDENCE_REGISTRY_ADDRESS || GOAT_ERC8004_ADDRESSES.testnet3.evidenceRegistry;
   if (!registryAddr || registryAddr === "0x0000000000000000000000000000000000000000") {
     errors.push("EVIDENCE_REGISTRY_ADDRESS cannot be zero or empty");
+  }
+  if (isProduction && !addressPattern.test(registryAddr || "")) {
+    errors.push("EVIDENCE_REGISTRY_ADDRESS must be an EVM address");
   }
 
   // 2. In production, session key is REQUIRED (no random wallet fallback)
@@ -25,6 +31,7 @@ export function validateBootConfiguration(env: Record<string, string | undefined
   if (isProduction && !sessionKmsKey) {
     errors.push("SESSION_AWS_KMS_KEY_ID is required in production; exportable session keys are development-only");
   }
+  if (isProduction && sessionKey) errors.push("SESSION_KEY must not be present in production");
 
   if (sessionKey && !/^(0x)?[0-9a-fA-F]{64}$/.test(sessionKey.trim())) {
     errors.push("SESSION_KEY must be a valid 64-character hex private key");
@@ -41,12 +48,25 @@ export function validateBootConfiguration(env: Record<string, string | undefined
   if (isProduction && (!env.INTERNAL_AGENT_HMAC_SECRET || env.INTERNAL_AGENT_HMAC_SECRET.trim().length < 32)) {
     errors.push("INTERNAL_AGENT_HMAC_SECRET is required in production and must be >= 32 characters");
   }
+  if (isProduction && (!env.INTERNAL_IDENTITY_HMAC_SECRET || env.INTERNAL_IDENTITY_HMAC_SECRET.trim().length < 32)) {
+    errors.push("INTERNAL_IDENTITY_HMAC_SECRET is required in production and must be >= 32 characters");
+  }
+  if (isProduction && (!env.SESSION_PROPOSAL_ENCRYPTION_KEY || env.SESSION_PROPOSAL_ENCRYPTION_KEY.trim().length < 32)) {
+    errors.push("SESSION_PROPOSAL_ENCRYPTION_KEY is required in production and must be >= 32 characters");
+  }
 
   // 5. Validate PRIVATE_KEY/RELAYER key in production
   const privateKey = env.PRIVATE_KEY || env.RELAYER_PRIVATE_KEY;
   const relayerKmsKey = env.AWS_KMS_KEY_ID || env.KMS_KEY_ID;
   if (isProduction && !relayerKmsKey) {
     errors.push("AWS_KMS_KEY_ID is required in production; exportable relayer keys are development-only");
+  }
+  if (isProduction && privateKey) errors.push("PRIVATE_KEY and RELAYER_PRIVATE_KEY must not be present in production");
+  if (isProduction && sessionKmsKey && relayerKmsKey && sessionKmsKey === relayerKmsKey) {
+    errors.push("Relayer and evidence session roles must use distinct KMS keys");
+  }
+  if (isProduction && (!env.NEXT_SESSION_AWS_KMS_KEY_ID || env.NEXT_SESSION_AWS_KMS_KEY_ID === sessionKmsKey || env.NEXT_SESSION_AWS_KMS_KEY_ID === relayerKmsKey)) {
+    errors.push("NEXT_SESSION_AWS_KMS_KEY_ID must stage a distinct production KMS key");
   }
   if (privateKey && !/^(0x)?[0-9a-fA-F]{64}$/.test(privateKey.trim())) {
     errors.push("PRIVATE_KEY or RELAYER_PRIVATE_KEY must be a valid 64-character hex private key");
@@ -79,27 +99,73 @@ export function validateBootConfiguration(env: Record<string, string | undefined
       errors.push("Mainnet evidence registry not configured");
     }
 
-    if (!env.USDC_TOKEN_ADDRESS || !env.USDC_USD_ORACLE_ADDRESS) {
+    if (!addressPattern.test(env.USDC_TOKEN_ADDRESS || "") || !addressPattern.test(env.USDC_USD_ORACLE_ADDRESS || "")) {
       errors.push("USDC_TOKEN_ADDRESS and USDC_USD_ORACLE_ADDRESS are required for the production x402 showcase");
+    }
+    const confirmations = Number(env.X402_MIN_CONFIRMATIONS || "0");
+    if (!Number.isSafeInteger(confirmations) || confirmations < 1 || confirmations > 64) {
+      errors.push("X402_MIN_CONFIRMATIONS must be an integer between 1 and 64");
+    }
+    const priceMaxAge = Number(env.PRICE_MAX_AGE_SECONDS || "0");
+    if (!Number.isSafeInteger(priceMaxAge) || priceMaxAge < 1 || priceMaxAge > 86_400) {
+      errors.push("PRICE_MAX_AGE_SECONDS must be an integer between 1 and 86400");
     }
     if (!env.X402_ALLOWED_MERCHANTS || !env.X402_ALLOWED_MERCHANT_ORIGINS) {
       errors.push("X402_ALLOWED_MERCHANTS and X402_ALLOWED_MERCHANT_ORIGINS are required in production");
+    } else {
+      const merchants = env.X402_ALLOWED_MERCHANTS.split(",").map((value) => value.trim()).filter(Boolean);
+      if (merchants.length === 0 || merchants.some((value) => !addressPattern.test(value))) {
+        errors.push("X402_ALLOWED_MERCHANTS must contain only EVM addresses");
+      }
+      try {
+        const origins = env.X402_ALLOWED_MERCHANT_ORIGINS.split(",").map((value) => value.trim()).filter(Boolean);
+        if (origins.length === 0 || origins.some((value) => {
+          const parsed = new URL(value);
+          return parsed.protocol !== "https:" || parsed.origin !== value;
+        })) errors.push("X402_ALLOWED_MERCHANT_ORIGINS must contain canonical HTTPS origins");
+      } catch {
+        errors.push("X402_ALLOWED_MERCHANT_ORIGINS contains an invalid URL");
+      }
     }
     if (env.EVIDENCE_ANCHORING_ENABLED !== "true" || env.STRICT_REGISTRY !== "true") {
       errors.push("Production evidence requires EVIDENCE_ANCHORING_ENABLED=true and STRICT_REGISTRY=true");
     }
-    if (!env.EVIDENCE_REGISTRY_CODE_HASH || !env.EVIDENCE_REGISTRY_OWNER || !env.EVIDENCE_CONTENT_BASE_URL) {
-      errors.push("Pinned registry code hash/owner and EVIDENCE_CONTENT_BASE_URL are required in production");
+    if (!bytes32Pattern.test(env.EVIDENCE_REGISTRY_CODE_HASH || "") ||
+        !addressPattern.test(env.EVIDENCE_REGISTRY_OWNER || "") || !env.EVIDENCE_CONTENT_BASE_URL ||
+        !env.EVIDENCE_CONTENT_WRITE_URL || !env.EVIDENCE_CONTENT_WRITE_TOKEN) {
+      errors.push("Pinned registry code hash/owner and immutable evidence read/write storage are required in production");
+    } else {
+      try {
+        if (new URL(env.EVIDENCE_CONTENT_BASE_URL).protocol !== "https:") {
+          errors.push("EVIDENCE_CONTENT_BASE_URL must use HTTPS in production");
+        }
+        if (new URL(env.EVIDENCE_CONTENT_WRITE_URL!).protocol !== "https:") {
+          errors.push("EVIDENCE_CONTENT_WRITE_URL must use HTTPS in production");
+        }
+      } catch {
+        errors.push("Evidence content read/write URL is invalid");
+      }
     }
     if (env.AGENTKIT_IDEMPOTENCY_MODE !== "redis" || !env.AGENTKIT_REDIS_URL) {
       errors.push("AGENTKIT_IDEMPOTENCY_MODE=redis and AGENTKIT_REDIS_URL are required in production");
     }
-    if (!env.GOAT_ACTION_MANIFEST_SHA256) {
+    if (!/^[a-fA-F0-9]{64}$/.test(env.GOAT_ACTION_MANIFEST_SHA256 || "")) {
       errors.push("GOAT_ACTION_MANIFEST_SHA256 is required to pin AgentKit tool metadata");
     }
     if (env.CLOUD_MODE === "true" && (!env.AZURE_MAA_TRUSTED_ISSUERS || !env.AZURE_MAA_AUDIENCE ||
         !env.AZURE_MAA_TRUSTED_ROOT_FINGERPRINTS || !env.AZURE_MAA_ALLOWED_MEASUREMENTS)) {
       errors.push("Verified Azure MAA mode requires pinned issuers, audience, root fingerprints, and measurements");
+    }
+    for (const [name, value] of Object.entries({
+      INTERNAL_AGENT_HMAC_SECRET: env.INTERNAL_AGENT_HMAC_SECRET,
+      INTERNAL_IDENTITY_HMAC_SECRET: env.INTERNAL_IDENTITY_HMAC_SECRET,
+      STATE_SIGNING_SECRET: env.STATE_SIGNING_SECRET,
+      SESSION_PROPOSAL_ENCRYPTION_KEY: env.SESSION_PROPOSAL_ENCRYPTION_KEY,
+      EVIDENCE_CONTENT_WRITE_TOKEN: env.EVIDENCE_CONTENT_WRITE_TOKEN,
+    })) {
+      if (isPlaceholder(value) || value!.trim().length < 32) {
+        errors.push(`${name} must be a vault-injected non-placeholder value of at least 32 characters`);
+      }
     }
   }
 

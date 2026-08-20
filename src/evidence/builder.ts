@@ -124,6 +124,8 @@ export interface EvidenceBundle {
     storedAt: number;
     immutable: boolean;
   } | null;
+  /** Immutable content URI bound by the EvidenceRegistry v3 authorization. */
+  storageUrl?: string;
   assembledAt: number;
   bundleHash?: string;
 }
@@ -398,7 +400,7 @@ export class EvidenceBuilder {
       // Looking only at the current allowlist would invalidate historical
       // evidence after a legitimate key rotation.
       const registryABI = [
-        "function getEvidenceRecord(bytes32) view returns (tuple(string agentId, bytes32 bundleHash, address sessionSigner, uint256 timestamp, address anchorer, bool exists))",
+        "function getEvidenceRecord(bytes32) view returns (tuple(string agentId, bytes32 bundleHash, address sessionSigner, uint256 timestamp, address anchorer, string storageUri, bool exists))",
       ];
       const registry = new ethers.Contract(registryAddress, registryABI, provider);
       const recoveredSigner = basicVerification.recoveredAddress;
@@ -425,6 +427,14 @@ export class EvidenceBuilder {
           valid: false,
           recoveredAddress: recoveredSigner,
           reason: "Registry record does not bind this agent and recovered evidence signer",
+          mandateVerified: false,
+        };
+      }
+      if (!bundle.storageUrl || record.storageUri !== bundle.storageUrl) {
+        return {
+          valid: false,
+          recoveredAddress: recoveredSigner,
+          reason: "Registry record does not bind this evidence storage URI",
           mandateVerified: false,
         };
       }

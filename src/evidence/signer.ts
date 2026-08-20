@@ -27,7 +27,7 @@ export class EthersSessionSigner implements SessionSigner {
     return this.signer.signTypedData(
       {
         name: "Veridex Evidence Registry",
-        version: "2",
+        version: "3",
         chainId: params.chainId,
         verifyingContract: params.verifyingContract,
       },
@@ -37,7 +37,7 @@ export class EthersSessionSigner implements SessionSigner {
   }
 }
 
-/** EIP-712 delegation consumed by EvidenceRegistry v2 when a relayer anchors a bundle. */
+/** EIP-712 delegation consumed by EvidenceRegistry v3 when a relayer anchors a bundle. */
 export interface EvidenceAuthorization {
   agentId: string;
   bundleHash: string;
@@ -45,6 +45,7 @@ export interface EvidenceAuthorization {
   deadline: number;
   chainId: number;
   verifyingContract: string;
+  storageUri: string;
 }
 
 export const EVIDENCE_AUTHORIZATION_TYPES: Record<string, TypedDataField[]> = {
@@ -52,6 +53,7 @@ export const EVIDENCE_AUTHORIZATION_TYPES: Record<string, TypedDataField[]> = {
     { name: "agentHash", type: "bytes32" },
     { name: "bundleHash", type: "bytes32" },
     { name: "sessionSigner", type: "address" },
+    { name: "storageUriHash", type: "bytes32" },
     { name: "deadline", type: "uint256" },
   ],
 };
@@ -129,7 +131,7 @@ export class LocalSessionSigner implements SessionSigner {
     return this.wallet.signTypedData(
       {
         name: "Veridex Evidence Registry",
-        version: "2",
+        version: "3",
         chainId: params.chainId,
         verifyingContract: params.verifyingContract,
       },
@@ -161,6 +163,9 @@ function validateEvidenceAuthorization(params: EvidenceAuthorization, expectedAd
   if (!Number.isSafeInteger(params.deadline) || params.deadline <= Math.floor(Date.now() / 1000)) {
     throw new Error("Evidence authorization deadline must be a future Unix timestamp");
   }
+  if (!params.storageUri || params.storageUri.length > 2_048) {
+    throw new Error("Evidence authorization requires a bounded storage URI");
+  }
 }
 
 function evidenceAuthorizationValue(params: EvidenceAuthorization) {
@@ -168,6 +173,7 @@ function evidenceAuthorizationValue(params: EvidenceAuthorization) {
     agentHash: id(params.agentId),
     bundleHash: params.bundleHash,
     sessionSigner: params.sessionSigner,
+    storageUriHash: id(params.storageUri),
     deadline: params.deadline,
   };
 }

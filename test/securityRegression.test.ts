@@ -546,12 +546,13 @@ describe("VD-GOAT-008: x402 challenge verification", () => {
 // ─── VD-GOAT-009: Registry Authorization ─────────────────────────────────────
 
 describe("VD-GOAT-009: Registry authorization", () => {
-  it("binds an evidence authorization to the v2 registry, session signer, and deadline", async () => {
+  it("binds an evidence authorization to the v3 registry, signer, URI, and deadline", async () => {
     const signer = new LocalSessionSigner("0x" + "c".repeat(64));
     const sessionSigner = await signer.getAddress();
     const verifyingContract = "0x1111111111111111111111111111111111111111";
     const deadline = Math.floor(Date.now() / 1000) + 300;
-    const bundleHash = ethers.id("bundle-v2-authorization");
+    const bundleHash = ethers.id("bundle-v3-authorization");
+    const storageUri = "https://evidence.example.com/bundles/immutable.json";
     const signature = await signer.signEvidenceAuthorization({
       agentId: "erc8004:48816:1042",
       bundleHash,
@@ -559,18 +560,20 @@ describe("VD-GOAT-009: Registry authorization", () => {
       deadline,
       chainId: 48816,
       verifyingContract,
+      storageUri,
     });
     const recovered = ethers.verifyTypedData(
-      { name: "Veridex Evidence Registry", version: "2", chainId: 48816, verifyingContract },
+      { name: "Veridex Evidence Registry", version: "3", chainId: 48816, verifyingContract },
       {
         EvidenceAuthorization: [
           { name: "agentHash", type: "bytes32" },
           { name: "bundleHash", type: "bytes32" },
           { name: "sessionSigner", type: "address" },
+          { name: "storageUriHash", type: "bytes32" },
           { name: "deadline", type: "uint256" },
         ],
       },
-      { agentHash: ethers.id("erc8004:48816:1042"), bundleHash, sessionSigner, deadline },
+      { agentHash: ethers.id("erc8004:48816:1042"), bundleHash, sessionSigner, storageUriHash: ethers.id(storageUri), deadline },
       signature,
     );
     expect(recovered).toBe(sessionSigner);

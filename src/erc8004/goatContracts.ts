@@ -112,7 +112,7 @@ export const EVIDENCE_REGISTRY_ABI = [
   "function authorizedAnchorers(bytes32, address) view returns (bool)",
   "function recordEvidence(string calldata agentId, bytes32 bundleHash, string calldata storageUri, address sessionSigner, uint256 authorizationDeadline, bytes calldata authorizationSignature) external",
   "function isEvidenceRecorded(bytes32 bundleHash) external view returns (bool)",
-  "function getEvidenceRecord(bytes32 bundleHash) external view returns (tuple(string agentId, bytes32 bundleHash, address sessionSigner, uint256 timestamp, address anchorer, bool exists))",
+  "function getEvidenceRecord(bytes32 bundleHash) external view returns (tuple(string agentId, bytes32 bundleHash, address sessionSigner, uint256 timestamp, address anchorer, string storageUri, bool exists))",
   "event EvidenceSignerSet(string indexed agentId, bytes32 indexed agentIdHash, address indexed signer, bool allowed)",
   "event AnchorerSet(string indexed agentId, bytes32 indexed agentIdHash, address indexed anchorer, bool allowed)",
   "event EvidenceRecorded(string indexed agentId, bytes32 indexed bundleHash, address indexed sessionSigner, address anchorer, uint256 timestamp, string storageUri)",

@@ -16,6 +16,8 @@ export interface AssetDefinition {
   symbol: string;
   decimals: number;
   priceUSD: number;
+  /** Exact policy valuation in millionths of one USD. */
+  priceUSDMicros?: bigint;
   native: boolean;
   /** Required for ERC-20 assets, must be null for native assets. */
   tokenAddress: string | null;
@@ -46,6 +48,10 @@ export function registerAsset(chainId: number, def: AssetDefinition): void {
   if (!Number.isSafeInteger(maxPriceAgeSeconds) || maxPriceAgeSeconds < 1 || maxPriceAgeSeconds > 86_400) {
     throw new Error(`[AssetRegistry] ${def.symbol} maxPriceAgeSeconds must be 1-86400`);
   }
+  const priceUSDMicros = def.priceUSDMicros ?? BigInt(Math.round(def.priceUSD * 1_000_000));
+  if (priceUSDMicros <= 0n || priceUSDMicros > 1_000_000_000_000_000n) {
+    throw new Error(`[AssetRegistry] ${def.symbol} exact USD-micros price is outside the supported range`);
+  }
   if (!def.native && !def.tokenAddress) {
     throw new Error(`[AssetRegistry] ERC-20 asset ${def.symbol} requires a tokenAddress`);
   }
@@ -57,6 +63,8 @@ export function registerAsset(chainId: number, def: AssetDefinition): void {
   }
   ASSET_REGISTRY.get(chainId)!.set(key(def.symbol), {
     ...def,
+    priceUSD: Number(priceUSDMicros) / 1_000_000,
+    priceUSDMicros,
     symbol: key(def.symbol),
     tokenAddress: def.tokenAddress ? ethers.getAddress(def.tokenAddress) : null,
     priceUpdatedAt,
@@ -240,7 +248,7 @@ export class TransactionDecoder {
       throw new Error("INVALID_AMOUNT: Transaction value is negative");
     }
 
-    const priceUSDMicros = BigInt(Math.round(asset.priceUSD * 1_000_000));
+    const priceUSDMicros = asset.priceUSDMicros!;
     const usdMicros = (rawValueBigInt * priceUSDMicros) / (10n ** BigInt(asset.decimals));
     if (usdMicros > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw new Error("INVALID_AMOUNT: USD valuation exceeds exact policy arithmetic range");

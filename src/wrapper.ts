@@ -13,12 +13,18 @@ export interface VeridexGoatConfig {
   policyRules: PolicyRuleConfig;
   sessionSigner?: SessionSigner;
   teeAttestationEnabled?: boolean;
-  onBundleEmitted?: (bundle: any) => void;
+  onBundleEmitted?: (bundle: any) => void | Promise<void>;
   expiresAt?: number;
   /** Required for multi-replica production enforcement; use PostgresPolicyStateProvider. */
   policyStateProvider?: PolicyStateProvider;
   /** Required for multi-replica session revocation; use PostgresSessionRevocationProvider. */
   sessionRevocationProvider?: SessionRevocationProvider;
+  /** Independent RPC verification required before direct-wrapper success evidence. */
+  transactionVerifier?: (params: {
+    txHash: string;
+    action: NormalizedAction;
+    result: unknown;
+  }) => Promise<{ txHash: string; status: 1; blockNumber?: number; blockHash?: string }>;
 }
 
 export interface SessionCreationOptions {
@@ -46,7 +52,7 @@ export class HumanApprovalRequiredError extends Error {
     super(message);
     this.name = "HumanApprovalRequiredError";
     this.evaluation = evaluation;
-    this.approvalId = `appr_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+    this.approvalId = `appr_${ethers.hexlify(ethers.randomBytes(32)).slice(2)}`;
   }
 }
 
@@ -313,7 +319,7 @@ export function wrapWalletAdapter(
               });
               const signedBundle = await activeSessionSigner.signBundle(denialBundle);
               if (config.onBundleEmitted) {
-                config.onBundleEmitted(signedBundle);
+                await config.onBundleEmitted(signedBundle);
               }
               throw new Error(`[Veridex Policy Denial] Payment blocked: ${evaluation.reasons.join(", ")}`);
             }
@@ -327,7 +333,7 @@ export function wrapWalletAdapter(
               });
               const signedBundle = await activeSessionSigner.signBundle(escalationBundle);
               if (config.onBundleEmitted) {
-                config.onBundleEmitted(signedBundle);
+                await config.onBundleEmitted(signedBundle);
               }
               throw new HumanApprovalRequiredError(
                 `[Veridex Policy Escalation] Human approval required: ${evaluation.reasons.join(", ")}`,
@@ -355,8 +361,18 @@ export function wrapWalletAdapter(
               if (!txHash) {
                 throw new Error("[Veridex Wallet Adapter] Underlying operation returned no transaction hash");
               }
+              if (!config.transactionVerifier &&
+                  (process.env.NODE_ENV === "production" || process.env.STRICT_SETTLEMENT_VERIFICATION === "true")) {
+                throw new Error("[Veridex Wallet Adapter] An independent transactionVerifier is required before success evidence");
+              }
+              if (config.transactionVerifier) {
+                const verified = await config.transactionVerifier({ txHash, action: boundAction!, result });
+                if (verified.status !== 1 || verified.txHash.toLowerCase() !== txHash.toLowerCase()) {
+                  throw new Error("[Veridex Wallet Adapter] RPC verification did not confirm the exact transaction");
+                }
+              }
 
-              // Commit policy limits now that transaction has successfully broadcasted (VD-GOAT-005 fix)
+              // Commit only after the independent verifier confirms settlement.
               await policyGate.commit(amountUSD, evaluation.evaluatedAt, actionId);
               committed = true;
 
@@ -370,7 +386,7 @@ export function wrapWalletAdapter(
 
               const signedBundle = await activeSessionSigner.signBundle(bundle);
               if (config.onBundleEmitted) {
-                config.onBundleEmitted(signedBundle);
+                await config.onBundleEmitted(signedBundle);
               }
               return result;
             } finally {

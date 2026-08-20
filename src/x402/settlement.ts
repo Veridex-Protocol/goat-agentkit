@@ -72,6 +72,9 @@ export class EvmRpcSettlementVerifier implements X402SettlementVerifier {
     if (ethers.getAddress(receipt.from) !== ethers.getAddress(action.from)) {
       throw new Error("Settlement payer does not match the normalized action");
     }
+    if (ethers.getAddress(transaction.from) !== ethers.getAddress(receipt.from)) {
+      throw new Error("Settlement transaction sender does not match the receipt payer");
+    }
 
     const expected = TransactionShape.from(action);
     if (!transaction.to || ethers.getAddress(transaction.to) !== ethers.getAddress(expected.to)) {
