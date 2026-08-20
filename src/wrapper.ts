@@ -25,6 +25,12 @@ export interface VeridexGoatConfig {
     action: NormalizedAction;
     result: unknown;
   }) => Promise<{ txHash: string; status: 1; blockNumber?: number; blockHash?: string }>;
+  /** Persist and reconcile any operation that may have broadcast but could not be verified. */
+  onTransactionUncertain?: (params: {
+    txHash?: string;
+    action: NormalizedAction;
+    error: unknown;
+  }) => void | Promise<void>;
 }
 
 export interface SessionCreationOptions {
@@ -65,6 +71,13 @@ export class SessionExpiredError extends Error {
     this.name = "SessionExpiredError";
     this.sessionAddress = sessionAddress;
     this.expiresAt = expiresAt;
+  }
+}
+
+export class WalletBroadcastUncertainError extends Error {
+  constructor(public readonly txHash: string | undefined, message: string, options?: { cause?: unknown }) {
+    super(txHash ? `${message} (transaction ${txHash})` : message, options);
+    this.name = "WalletBroadcastUncertainError";
   }
 }
 
@@ -263,13 +276,13 @@ export function wrapWalletAdapter(
             // Direct message and typed-data signing can grant authority that is
             // not representable by this transfer-only action type. Disable them
             // until they have their own exact normalizers.
-            if (["signMessage", "signTypedData", "_signTypedData", "sendUserOperation", "signUserOperation", "permit", "permit2", "writeContract"].includes(prop as string)) {
+            if (["signMessage", "signTransaction", "signTypedData", "_signTypedData", "sendUserOperation", "signUserOperation", "permit", "permit2", "writeContract"].includes(prop as string)) {
               throw new Error(
                 `[Veridex Wallet Adapter] ${String(prop)} is disabled until an exact normalized action type is implemented for it.`
               );
             }
 
-            if (["sendTransaction", "signTransaction", "transfer", "sendRawTransaction"].includes(prop as string)) {
+            if (["sendTransaction", "transfer", "sendRawTransaction"].includes(prop as string)) {
               assertExecutionMatchesNormalizedAction(boundAction, txPayload);
             }
 
@@ -352,6 +365,8 @@ export function wrapWalletAdapter(
             }
 
             let committed = false;
+            let operationMayHaveBroadcast = false;
+            let observedTxHash: string | undefined;
             try {
               // 3. TEE Attestation Quote Fetch (If enabled)
               let teeAttestation;
@@ -363,14 +378,16 @@ export function wrapWalletAdapter(
               let result;
               if (typeof target[prop] === "function") {
                 result = await target[prop](...args);
+                operationMayHaveBroadcast = true;
               } else {
                 throw new Error(`Underlying wallet adapter function '${String(prop)}' is not invokable`);
               }
 
               const txHash = typeof result === "string" ? result : result?.hash;
-              if (!txHash) {
+              if (!txHash || !/^0x[a-fA-F0-9]{64}$/.test(txHash)) {
                 throw new Error("[Veridex Wallet Adapter] Underlying operation returned no transaction hash");
               }
+              observedTxHash = txHash;
               if (!config.transactionVerifier &&
                   (process.env.NODE_ENV === "production" || process.env.STRICT_SETTLEMENT_VERIFICATION === "true")) {
                 throw new Error("[Veridex Wallet Adapter] An independent transactionVerifier is required before success evidence");
@@ -399,8 +416,18 @@ export function wrapWalletAdapter(
                 await config.onBundleEmitted(signedBundle);
               }
               return result;
+            } catch (error) {
+              if (operationMayHaveBroadcast) {
+                await config.onTransactionUncertain?.({ txHash: observedTxHash, action: boundAction!, error });
+                throw new WalletBroadcastUncertainError(
+                  observedTxHash,
+                  "[Veridex Wallet Adapter] Transaction outcome is uncertain; the policy reservation was retained for reconciliation",
+                  { cause: error },
+                );
+              }
+              throw error;
             } finally {
-              if (!committed) {
+              if (!committed && !operationMayHaveBroadcast) {
                 await policyGate.releaseReservation(actionId);
               }
             }

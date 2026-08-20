@@ -99,6 +99,13 @@ export interface X402ExecutionSecurity {
     challenge: X402Challenge;
     context?: unknown;
   }) => Promise<{ authorized: true; proof?: unknown }>;
+  /** Persist enough information to reconcile a transaction whose hash may have broadcast. */
+  uncertainSettlementHandler?: (params: {
+    txHash?: string;
+    action: NormalizedAction;
+    challenge: X402Challenge;
+    error: unknown;
+  }) => void | Promise<void>;
 }
 
 export function canonicalX402Challenge(challenge: X402Challenge): string {
@@ -692,7 +699,7 @@ export function wrapX402PaymentActions(
           }
           result = await action.execute(input, context);
           txHash = typeof result?.txHash === "string" ? result.txHash : result?.settlementReceipt?.txHash;
-          if (!txHash || !settlementVerifier) {
+          if (!txHash || !/^0x[a-fA-F0-9]{64}$/.test(txHash) || !settlementVerifier) {
             throw new Error("[Veridex x402] An RPC-backed settlement verifier and transaction hash are required");
           }
           settlement = await settlementVerifier.verify({ txHash, action: normalized, challenge });
@@ -721,8 +728,15 @@ export function wrapX402PaymentActions(
             }
           }
         } catch (error) {
-          if (error instanceof X402BroadcastUncertainError) {
+          const uncertainHash = txHash || (error instanceof X402BroadcastUncertainError ? error.txHash : undefined);
+          if (error instanceof X402BroadcastUncertainError || uncertainHash !== undefined) {
             broadcastUncertain = true;
+            await options?.uncertainSettlementHandler?.({
+              txHash: uncertainHash,
+              action: normalized,
+              challenge,
+              error,
+            });
           }
           throw error;
         } finally {
@@ -923,10 +937,10 @@ export class VeridexGoatX402Payer {
       if (walletAdapter && typeof walletAdapter.sendTransaction === "function") {
         const execution = TransactionDecoder.buildExecutionRequest(normalizedAction);
         const res = await walletAdapter.sendTransaction({ ...execution, _normalizedAction: normalizedAction });
-        txHash = typeof res === "string" ? undefined : res?.hash;
+        txHash = typeof res === "string" ? res : res?.hash;
       }
 
-      if (!txHash) {
+      if (!txHash || !/^0x[a-fA-F0-9]{64}$/.test(txHash)) {
         throw new Error(
           "[Veridex x402] Wallet adapter did not return a transaction hash. " +
           "Cannot produce settlement evidence without a verified on-chain receipt."
@@ -950,8 +964,15 @@ export class VeridexGoatX402Payer {
         }
       }
     } catch (error) {
-      if (error instanceof X402BroadcastUncertainError) {
+      const uncertainHash = txHash || (error instanceof X402BroadcastUncertainError ? error.txHash : undefined);
+      if (error instanceof X402BroadcastUncertainError || uncertainHash !== undefined) {
         broadcastUncertain = true;
+        await security.uncertainSettlementHandler?.({
+          txHash: uncertainHash,
+          action: normalizedAction,
+          challenge,
+          error,
+        });
       }
       throw error;
     } finally {
