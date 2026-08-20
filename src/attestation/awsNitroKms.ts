@@ -1,6 +1,6 @@
 import { keccak256, toUtf8Bytes } from "ethers";
 import fs from "fs";
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 import { AttestationProvider, TEEAttestationReport, TEEProviderType } from "./types.js";
 
 /**
@@ -38,7 +38,11 @@ export class AwsNitroKmsAttestationProvider implements AttestationProvider {
       if (fs.existsSync(this.nsmDevicePath)) {
         // AWS Nitro NSM requires specific ioctl calls.
         // We invoke the nsm-cli system tool to fetch the CBOR attestation document securely.
-        const output = execSync(`/usr/bin/nsm-cli --user-data ${boundHash} --raw`, { stdio: "pipe" });
+        const output = execFileSync(
+          "/usr/bin/nsm-cli",
+          ["--user-data", boundHash, "--raw"],
+          { stdio: "pipe", timeout: 10_000, maxBuffer: 2 * 1024 * 1024 },
+        );
         const hexQuote = output.toString("hex");
 
         // VRD-2026-006 fix: Do not fabricate a PCR0. The measurement must be parsed

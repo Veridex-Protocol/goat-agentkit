@@ -52,9 +52,30 @@ function usdMicros(value: number, label: string): number {
   return micros;
 }
 
-export function sanitizePolicyState(value: Partial<PolicyState> | undefined): PolicyState {
+export function sanitizePolicyState(value: Partial<PolicyState> | undefined, strict = false): PolicyState {
   const fallback = createDefaultPolicyState();
-  if (!value || typeof value !== "object") return fallback;
+  if (!value || typeof value !== "object") {
+    if (strict) throw new Error("Policy state is missing or is not an object");
+    return fallback;
+  }
+  if (strict) {
+    const reservations = value.reservations;
+    const reservationEntries = reservations && typeof reservations === "object" && !Array.isArray(reservations)
+      ? Object.entries(reservations)
+      : [];
+    const valid = Array.isArray(value.txTimestamps) && value.txTimestamps.length <= 10_000 &&
+      value.txTimestamps.every((timestamp) => Number.isFinite(timestamp) && timestamp >= 0) &&
+      Number.isFinite(value.dailySpendUSD) && (value.dailySpendUSD as number) >= 0 &&
+      Number.isSafeInteger(value.lastSpendResetDay) && (value.lastSpendResetDay as number) >= 0 &&
+      Number.isFinite(value.lastTxTimestamp) && (value.lastTxTimestamp as number) >= 0 &&
+      typeof value.isCircuitBreakerTripped === "boolean" &&
+      !!reservations && typeof reservations === "object" && !Array.isArray(reservations) &&
+      reservationEntries.length <= 10_000 && reservationEntries.every(([id, amount]) =>
+        id.length > 0 && id.length <= 256 && Number.isFinite(amount) && (amount as number) >= 0) &&
+      Array.isArray(value.processedActionIds) && value.processedActionIds.length <= 10_000 &&
+      value.processedActionIds.every((id) => typeof id === "string" && id.length > 0 && id.length <= 256);
+    if (!valid) throw new Error("Policy state failed strict structural validation");
+  }
   const dailySpendUSD = value.dailySpendUSD;
   const lastSpendResetDay = value.lastSpendResetDay;
   const lastTxTimestamp = value.lastTxTimestamp;
@@ -96,7 +117,10 @@ export class FilePolicyStateProvider implements PolicyStateProvider {
     try {
       const state = this.stateFile.read();
       if (state) {
-        return state;
+        return sanitizePolicyState(
+          state,
+          process.env.NODE_ENV === "production" || process.env.STRICT_STATE_PERSISTENCE === "true",
+        );
       }
     } catch (error: any) {
       // VRD-2026-007 fix: Fail closed on corrupt state in production

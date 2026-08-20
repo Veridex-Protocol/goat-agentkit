@@ -75,7 +75,7 @@ export class AzureMaaAttestationProvider implements AttestationProvider {
           return {
             provider: parsed.verified ? "azure-maa/sev-snp" : "azure-maa/sev-snp-unverified",
             quote: jwtToken,
-            measurement: parsed.measurement || "0x2b8d4056a1f3e7c9b0d2854f6a9e1c3b7d05f28a4c6e1b9d3f705a2c8f3a1c7e9",
+            measurement: parsed.measurement || "0x0000000000000000000000000000000000000000000000000000000000000000",
             boundHash,
             issuerCertChain: parsed.certChain,
             timestamp,
@@ -98,13 +98,18 @@ export class AzureMaaAttestationProvider implements AttestationProvider {
         );
         const res = JSON.parse(output.toString("utf-8"));
         const hexQuote = res.quote || res.attestationToken || res.token || res.raw_quote;
-        const measurement = res.measurement || "0x2b8d4056a1f3e7c9b0d2854f6a9e1c3b7d05f28a4c6e1b9d3f705a2c8f3a1c7e9";
+        if (typeof hexQuote !== "string" || hexQuote.length === 0 || hexQuote.length > 1_048_576) {
+          throw new Error("[Azure MAA] Direct device response did not contain a bounded quote");
+        }
+        const measurement = typeof res.measurement === "string" && /^0x[0-9a-fA-F]{64,128}$/.test(res.measurement)
+          ? res.measurement
+          : "0x0000000000000000000000000000000000000000000000000000000000000000";
 
         if (this.requiresVerifiedAttestation()) {
           throw new Error("[Azure MAA] Direct device quote has no configured remote verification path");
         }
         return {
-          provider: "azure-maa/sev-snp",
+          provider: "azure-maa/sev-snp-unverified",
           quote: hexQuote,
           measurement,
           boundHash,
@@ -338,6 +343,57 @@ export class AzureMaaAttestationProvider implements AttestationProvider {
         if (!m || !allowedSet.has(m)) {
           signatureVerified = false;
           signatureError = `Measurement ${m || "(missing)"} not in approved allowlist`;
+        }
+      }
+
+      // 8. A valid Microsoft signature is not by itself an acceptable platform
+      // state. Production policy pins the attestation product, accepted TCB
+      // status, and minimum guest security version, and always rejects debug
+      // guests. Claim names cover the current SEV-SNP MAA token shapes.
+      const debugValue = payload["x-ms-sevsnpvm-is-debuggable"] ??
+        payload["x-ms-isolation-tee"]?.["is-debuggable"];
+      if (signatureVerified && (debugValue === true || String(debugValue).toLowerCase() === "true")) {
+        signatureVerified = false;
+        signatureError = "Debug-enabled confidential guests are not trusted";
+      }
+      const tcbStatus = payload["x-ms-sevsnpvm-compliance-status"] ??
+        payload["x-ms-compliance-status"] ?? payload["x-ms-isolation-tee"]?.["compliance-status"];
+      const allowedTcbStatuses = process.env.AZURE_MAA_ALLOWED_TCB_STATUSES;
+      if (strict && !allowedTcbStatuses) {
+        signatureVerified = false;
+        signatureError = "AZURE_MAA_ALLOWED_TCB_STATUSES is required when verified attestation is required";
+      }
+      if (signatureVerified && allowedTcbStatuses) {
+        const accepted = new Set(allowedTcbStatuses.split(",").map((value) => value.trim().toLowerCase()).filter(Boolean));
+        if (typeof tcbStatus !== "string" || !accepted.has(tcbStatus.toLowerCase())) {
+          signatureVerified = false;
+          signatureError = `TCB status ${tcbStatus || "(missing)"} is not approved`;
+        }
+      }
+      const product = payload["x-ms-attestation-type"] ?? payload["x-ms-sevsnpvm-product-name"] ??
+        payload["x-ms-isolation-tee"]?.type;
+      const allowedProducts = process.env.AZURE_MAA_ALLOWED_PRODUCTS;
+      if (strict && !allowedProducts) {
+        signatureVerified = false;
+        signatureError = "AZURE_MAA_ALLOWED_PRODUCTS is required when verified attestation is required";
+      }
+      if (signatureVerified && allowedProducts) {
+        const accepted = new Set(allowedProducts.split(",").map((value) => value.trim().toLowerCase()).filter(Boolean));
+        if (typeof product !== "string" || !accepted.has(product.toLowerCase())) {
+          signatureVerified = false;
+          signatureError = `Attestation product ${product || "(missing)"} is not approved`;
+        }
+      }
+      const guestSvn = Number(payload["x-ms-sevsnpvm-guestsvn"] ?? payload["x-ms-isolation-tee"]?.["guest-svn"]);
+      const minimumGuestSvn = Number(process.env.AZURE_MAA_MIN_GUEST_SVN);
+      if (strict && (!Number.isSafeInteger(minimumGuestSvn) || minimumGuestSvn < 0)) {
+        signatureVerified = false;
+        signatureError = "AZURE_MAA_MIN_GUEST_SVN must be a non-negative integer when verified attestation is required";
+      }
+      if (signatureVerified && Number.isSafeInteger(minimumGuestSvn)) {
+        if (!Number.isSafeInteger(guestSvn) || guestSvn < minimumGuestSvn) {
+          signatureVerified = false;
+          signatureError = `Guest SVN ${Number.isFinite(guestSvn) ? guestSvn : "(missing)"} is below required ${minimumGuestSvn}`;
         }
       }
 

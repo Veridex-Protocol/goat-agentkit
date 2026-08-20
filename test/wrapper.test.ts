@@ -6,6 +6,8 @@ import {
   VeridexPolicyGate,
   EvidenceBuilder,
   LocalSessionSigner,
+  TransactionDecoder,
+  registerAsset,
 } from "../src/index.js";
 import * as fs from "fs";
 import { ethers } from "ethers";
@@ -58,17 +60,23 @@ describe("@veridex/goat-agentkit", () => {
       },
     });
 
-    const normalizedAction: any = Object.freeze({
-      actionId: ethers.id("rotation-test-action"), chainId: 30,
-      from: "0x2222222222222222222222222222222222222222",
-      to: "0x1111111111111111111111111111111111111111", value: 2500000n,
-      assetType: "native", symbol: "USDC", tokenAddress: null, calldataSelector: "0x00000000",
-      decimals: 6, priceUSD: 1, usdValue: 2.5,
+    const token = "0x3333333333333333333333333333333333333333";
+    registerAsset(30, {
+      symbol: "USDC", decimals: 6, native: false, tokenAddress: token,
+      priceUSD: 1, priceUSDMicros: 1_000_000n,
+      priceUpdatedAt: Math.floor(Date.now() / 1000), priceSource: "test:fixed", maxPriceAgeSeconds: 300,
     });
+    const normalizedAction = TransactionDecoder.decodeAndNormalize({
+      chainId: 30,
+      from: "0x2222222222222222222222222222222222222222",
+      to: "0x1111111111111111111111111111111111111111",
+      humanAmount: "2.5",
+      asset: "USDC",
+    });
+    const firstExecution = TransactionDecoder.buildExecutionRequest(normalizedAction);
 
     await wrappedWallet.sendTransaction({
-      to: "0x1111111111111111111111111111111111111111",
-      value: 2500000n,
+      ...firstExecution,
       _normalizedAction: normalizedAction,
     });
 
@@ -83,10 +91,16 @@ describe("@veridex/goat-agentkit", () => {
 
     rotateSessionKey(wrappedWallet, session2);
 
+    const secondAction = TransactionDecoder.decodeAndNormalize({
+      chainId: 30,
+      from: normalizedAction.from,
+      to: "0x4444444444444444444444444444444444444444",
+      humanAmount: "2.5",
+      asset: "USDC",
+    });
     await wrappedWallet.sendTransaction({
-      to: "0x1111111111111111111111111111111111111111",
-      value: 2500000n,
-      _normalizedAction: { ...normalizedAction, actionId: ethers.id("rotation-test-action-2") },
+      ...TransactionDecoder.buildExecutionRequest(secondAction),
+      _normalizedAction: secondAction,
     });
 
 

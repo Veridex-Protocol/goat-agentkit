@@ -6,7 +6,7 @@ Security and evidence controls for GOAT Network AgentKit: exact transaction norm
 
 - A value-bearing operation must carry one immutable `NormalizedAction`. Caller-provided USD values, token labels, calldata semantics, or browser signatures are never authorization inputs.
 - Production policy reservations, spend accounting, replay nonces, and session revocation require transactional shared providers.
-- x402 success requires a complete merchant-signed V2 challenge and an RPC-verified mined transaction matching payer, chain, recipient/token contract, raw amount, calldata or native value, ERC-20 transfer log, and confirmation depth.
+- x402 success requires a complete merchant-signed, payer-bound V2 challenge, an exact EIP-712 payer authorization, and an RPC-verified mined transaction matching payer, chain, recipient/token contract, raw amount, calldata or native value, ERC-20 transfer log, and confirmation depth.
 - Direct wallet-wrapper success evidence requires an independent `transactionVerifier` in production.
 - EvidenceRegistry v3 separates evidence signers from gas-paying anchorers and binds the exact immutable storage URI in its EIP-712 authorization.
 - Exportable session/relayer keys, unverified TEE claims, stale prices, unsigned metadata, and silent state resets fail closed in production.

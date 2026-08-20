@@ -301,18 +301,8 @@ export function wrapWalletAdapter(
               metadata: { method: prop, txPayload },
             });
 
-            // 1b. Atomic Budget Reservation. The action identifier is generated
-            // by the normalizer and is stable across retries, so replay handling
-            // is durable rather than Date.now()-based.
-            const actionId = boundAction!.actionId;
-            const reservationSuccess = await policyGate.reserve(actionId, amountUSD);
-            if (!reservationSuccess) {
-              throw new Error(`[Veridex Policy Denial] Budget reservation failed: would exceed daily limit`);
-            }
-
             // 2. Pre-Signature Enforcement Gate: Denial
             if (evaluation.verdict === "deny") {
-              await policyGate.releaseReservation(actionId);
               const denialBundle = evidenceBuilder.buildDenial({
                 payload: { to: recipient, amount, asset, chain },
                 evaluation,
@@ -326,7 +316,6 @@ export function wrapWalletAdapter(
 
             // 2b. Pre-Signature Enforcement Gate: Escalation
             if (evaluation.verdict === "escalate") {
-              await policyGate.releaseReservation(actionId);
               const escalationBundle = evidenceBuilder.buildDenial({
                 payload: { to: recipient, amount, asset, chain },
                 evaluation,
@@ -339,6 +328,27 @@ export function wrapWalletAdapter(
                 `[Veridex Policy Escalation] Human approval required: ${evaluation.reasons.join(", ")}`,
                 evaluation
               );
+            }
+
+            // 2c. Reserve only an allowed action. Denied/escalated actions must
+            // still emit their signed evidence bundle and never needlessly
+            // mutate spend state. The action identifier is stable across retries.
+            const actionId = boundAction!.actionId;
+            const reservationSuccess = await policyGate.reserve(actionId, amountUSD);
+            if (!reservationSuccess) {
+              const reservationDenial = evidenceBuilder.buildDenial({
+                payload: { to: recipient, amount, asset, chain },
+                evaluation: {
+                  ...evaluation,
+                  verdict: "deny",
+                  reasons: [...evaluation.reasons, "Atomic budget reservation rejected the action"],
+                },
+              });
+              const signedBundle = await activeSessionSigner.signBundle(reservationDenial);
+              if (config.onBundleEmitted) {
+                await config.onBundleEmitted(signedBundle);
+              }
+              throw new Error(`[Veridex Policy Denial] Budget reservation failed: would exceed an active policy limit`);
             }
 
             let committed = false;

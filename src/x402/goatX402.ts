@@ -6,7 +6,7 @@ import { LocalSessionSigner, SessionSigner } from "../evidence/signer.js";
 import { HumanApprovalRequiredError, SessionExpiredError } from "../wrapper.js";
 import { x402RateLimiter } from "../utils/rateLimiter.js";
 import type { NormalizedAction } from "../types/action.js";
-import { TransactionDecoder } from "../policy/decoder.js";
+import { assertNormalizedActionIntegrity, TransactionDecoder } from "../policy/decoder.js";
 import { Pool, type PoolConfig } from "pg";
 import type { SessionRevocationProvider } from "../session/revocation.js";
 import type { VerifiedX402Settlement, X402SettlementVerifier } from "./settlement.js";
@@ -34,6 +34,8 @@ export interface X402Challenge {
   accepts: string; // e.g. "USDC" or "GOAT"
   amount: string; // e.g. "2500000" (raw units or string)
   amountUSD?: number;
+  /** Exact account authorized to satisfy this invoice. */
+  payer: string;
   payTo: string;
   chain: number;
   scheme: "exact" | "authorization" | "eip3009";
@@ -86,6 +88,17 @@ export interface X402ExecutionSecurity {
     challenge: X402Challenge;
     context?: unknown;
   }) => Promise<boolean>;
+  /**
+   * Submit the payer's exact off-chain authorization for schemes that require
+   * it. The callback normally signs the output of
+   * `buildX402PaymentAuthorization()` with a KMS/HSM-backed payer and submits
+   * it to the allowlisted merchant. Direct `exact` transfers do not use it.
+   */
+  paymentAuthorizer?: (params: {
+    action: NormalizedAction;
+    challenge: X402Challenge;
+    context?: unknown;
+  }) => Promise<{ authorized: true; proof?: unknown }>;
 }
 
 export function canonicalX402Challenge(challenge: X402Challenge): string {
@@ -98,6 +111,7 @@ export function canonicalX402Challenge(challenge: X402Challenge): string {
     tokenAddress: challenge.tokenAddress,
     amount: challenge.amount,
     amountUSD: challenge.amountUSD,
+    payer: challenge.payer,
     payTo: challenge.payTo,
     chain: challenge.chain,
     scheme: challenge.scheme,
@@ -105,6 +119,60 @@ export function canonicalX402Challenge(challenge: X402Challenge): string {
     validAfter: challenge.validAfter,
     validBefore: challenge.validBefore,
   });
+}
+
+/**
+ * Stable, framework-independent EIP-712 authorization submitted by the payer
+ * before settlement. This is an off-chain merchant authorization; the actual
+ * asset movement remains an independently signed and verified chain
+ * transaction.
+ */
+export const X402_PAYMENT_AUTHORIZATION_DOMAIN = {
+  name: "Veridex GOAT x402 Merchant",
+  version: "1",
+} as const;
+
+export const X402_PAYMENT_AUTHORIZATION_TYPES = {
+  PaymentAuthorization: [
+    { name: "payer", type: "address" },
+    { name: "payTo", type: "address" },
+    { name: "tokenAddress", type: "address" },
+    { name: "amount", type: "uint256" },
+    { name: "orderId", type: "string" },
+    { name: "resource", type: "string" },
+    { name: "nonce", type: "bytes32" },
+    { name: "validAfter", type: "uint256" },
+    { name: "validBefore", type: "uint256" },
+  ],
+} as const;
+
+export function buildX402PaymentAuthorization(challenge: X402Challenge): {
+  domain: ethers.TypedDataDomain;
+  types: typeof X402_PAYMENT_AUTHORIZATION_TYPES;
+  value: Record<string, string | number>;
+} {
+  if (!challenge.nonce || challenge.validBefore === undefined) {
+    throw new Error("x402 authorization requires nonce and validBefore");
+  }
+  return {
+    domain: {
+      ...X402_PAYMENT_AUTHORIZATION_DOMAIN,
+      chainId: challenge.chain,
+      verifyingContract: ethers.getAddress(challenge.payTo),
+    },
+    types: X402_PAYMENT_AUTHORIZATION_TYPES,
+    value: {
+      payer: ethers.getAddress(challenge.payer),
+      payTo: ethers.getAddress(challenge.payTo),
+      tokenAddress: challenge.tokenAddress ? ethers.getAddress(challenge.tokenAddress) : ethers.ZeroAddress,
+      amount: challenge.amount,
+      orderId: challenge.orderId,
+      resource: challenge.resource,
+      nonce: challenge.nonce,
+      validAfter: challenge.validAfter ?? 0,
+      validBefore: challenge.validBefore,
+    },
+  };
 }
 
 export interface EIP3009Authorization {
@@ -240,6 +308,7 @@ export function parseX402Challenge(responseHeaders: Record<string, string>, resp
         accepts: decoded.accepts || "USDC",
         amount: String(decoded.amount || decoded.priceUSDC || "0"),
         amountUSD,
+        payer: decoded.payer,
         payTo: decoded.payTo,
         chain: decoded.chain || 48816,
         scheme: decoded.scheme || "authorization",
@@ -272,6 +341,7 @@ export function parseX402Challenge(responseHeaders: Record<string, string>, resp
       accepts: responseBody.accepts || "USDC",
       amount: String(responseBody.priceUSDC || responseBody.amount || "0"),
       amountUSD,
+      payer: responseBody.payer,
       payTo: responseBody.payTo,
       chain: responseBody.chain || 48816,
       scheme: responseBody.scheme || "authorization",
@@ -345,6 +415,12 @@ export async function verifyX402Challenge(
   if (!/^\d+$/.test(challenge.amount) || BigInt(challenge.amount) <= 0n) {
     return { valid: false, reason: "Challenge amount must be a positive base-unit integer" };
   }
+  if (!/^[A-Za-z0-9]{2,16}$/.test(challenge.accepts || "")) {
+    return { valid: false, reason: "Challenge asset symbol is invalid" };
+  }
+  if (!["exact", "authorization", "eip3009"].includes(challenge.scheme)) {
+    return { valid: false, reason: "Challenge settlement scheme is unsupported" };
+  }
   if (!Number.isFinite(challenge.amountUSD) || challenge.amountUSD! < 0) {
     return { valid: false, reason: "Challenge amountUSD is invalid" };
   }
@@ -352,6 +428,7 @@ export async function verifyX402Challenge(
     return { valid: false, reason: "Challenge chain is invalid" };
   }
   try {
+    ethers.getAddress(challenge.payer);
     ethers.getAddress(challenge.payTo);
     if (challenge.tokenAddress) ethers.getAddress(challenge.tokenAddress);
   } catch {
@@ -472,6 +549,7 @@ export function wrapX402PaymentActions(
             `[Veridex x402 Actions] Unbound spending action '${action.name}' rejected. Supply an immutable _normalizedAction; caller amountUSD is not trusted.`
           );
         }
+        assertNormalizedActionIntegrity(normalized);
         const challenge = input?.x402Challenge as X402Challenge | undefined;
         if (!challenge) {
           throw new Error(`[Veridex x402 Actions] Authenticated x402 challenge is required for '${action.name}'.`);
@@ -491,6 +569,7 @@ export function wrapX402PaymentActions(
         const asset = normalized.symbol;
         const chain = normalized.chainId;
         if (
+          ethers.getAddress(challenge.payer) !== ethers.getAddress(normalized.from) ||
           ethers.getAddress(challenge.payTo) !== ethers.getAddress(recipient) ||
           challenge.chain !== chain ||
           challenge.accepts.toUpperCase() !== asset.toUpperCase() ||
@@ -574,10 +653,20 @@ export function wrapX402PaymentActions(
         if (!consumed.valid) throw new Error(`[Veridex x402] Challenge consumption failed: ${consumed.reason}`);
         const reserved = await policyGate.reserve(actionId, amountUSD);
         if (!reserved) {
+          const reservationBundle = await signer.signBundle(evidenceBuilder.buildDenial({
+            payload: { to: recipient, amount, asset, chain },
+            evaluation: {
+              ...evaluation,
+              verdict: "deny",
+              reasons: [...evaluation.reasons, "Atomic budget reservation rejected the action"],
+            },
+          }));
+          if (onBundleEmitted) await onBundleEmitted(reservationBundle);
           return {
             status: "POLICY_BLOCKED",
             blocked: true,
             reasons: ["Budget reservation failed: would exceed daily spending limit"],
+            evidenceBundle: reservationBundle,
             error: "[Veridex x402] Budget reservation failed: would exceed daily spending limit",
           };
         }
@@ -592,6 +681,15 @@ export function wrapX402PaymentActions(
         let committed = false;
         let broadcastUncertain = false;
         try {
+          if (challenge.scheme !== "exact") {
+            if (!options?.paymentAuthorizer) {
+              throw new Error(`[Veridex x402] Scheme '${challenge.scheme}' requires a payer authorization submitter`);
+            }
+            const authorization = await options.paymentAuthorizer({ action: normalized, challenge, context });
+            if (authorization?.authorized !== true) {
+              throw new Error("[Veridex x402] Merchant did not accept the payer authorization");
+            }
+          }
           result = await action.execute(input, context);
           txHash = typeof result?.txHash === "string" ? result.txHash : result?.settlementReceipt?.txHash;
           if (!txHash || !settlementVerifier) {
@@ -695,18 +793,22 @@ export class VeridexGoatX402Payer {
     txHash?: string;
     evidenceBundle: EvidenceBundle;
   }> {
+    assertNormalizedActionIntegrity(normalizedAction);
+    const security = { ...this.security, ...verificationOptions };
     // VRD-2026-005 fix: Mandatory challenge verification before execution
     const verification = await verifyX402Challenge(challenge, {
-      usedNonces: verificationOptions?.usedNonces,
-      allowedMerchants: verificationOptions?.allowedMerchants,
-      nonceStore: verificationOptions?.nonceStore,
-      allowedMerchantOrigins: verificationOptions?.allowedMerchantOrigins,
+      usedNonces: security.usedNonces,
+      allowedMerchants: security.allowedMerchants,
+      nonceStore: security.nonceStore,
+      allowedMerchantOrigins: security.allowedMerchantOrigins,
+      consumeNonce: false,
     });
     if (!verification.valid) {
       throw new Error(`[Veridex x402] Challenge verification failed: ${verification.reason}`);
     }
 
     if (
+      ethers.getAddress(challenge.payer) !== ethers.getAddress(normalizedAction.from) ||
       ethers.getAddress(challenge.payTo) !== ethers.getAddress(normalizedAction.to) ||
       challenge.chain !== normalizedAction.chainId ||
       challenge.accepts.toUpperCase() !== normalizedAction.symbol.toUpperCase() ||
@@ -719,7 +821,7 @@ export class VeridexGoatX402Payer {
     const amountUSD = normalizedAction.usdValue;
 
     const sessionAddr = await this.sessionSigner.getAddress();
-    await assertX402SessionActive(sessionAddr, this.agentId, verificationOptions || this.security);
+    await assertX402SessionActive(sessionAddr, this.agentId, security);
     const sessionKeyHash = ethers.id(sessionAddr);
     const evidenceBuilder = new EvidenceBuilder(this.agentId, sessionKeyHash);
 
@@ -772,9 +874,33 @@ export class VeridexGoatX402Payer {
     // VRD-2026-007 fix: reserve budget atomically, execute in try/finally, and
     // release on any non-committed exit.
     const actionId = ethers.id(`${normalizedAction.actionId}:${challenge.orderId}:${challenge.nonce}`);
+    const consumed = await verifyX402Challenge(challenge, {
+      usedNonces: security.usedNonces,
+      allowedMerchants: security.allowedMerchants,
+      nonceStore: security.nonceStore,
+      allowedMerchantOrigins: security.allowedMerchantOrigins,
+      consumeNonce: true,
+    });
+    if (!consumed.valid) throw new Error(`[Veridex x402] Challenge consumption failed: ${consumed.reason}`);
     const reserved = await this.policyGate.reserve(actionId, amountUSD);
     if (!reserved) {
-      throw new Error("[Veridex x402] Budget reservation failed: would exceed daily spending limit");
+      const reservationBundle = await this.sessionSigner.signBundle(evidenceBuilder.buildDenial({
+        payload: {
+          to: challenge.payTo,
+          amount: challenge.amount,
+          asset: challenge.accepts,
+          chain: challenge.chain,
+        },
+        evaluation: {
+          ...evaluation,
+          verdict: "deny",
+          reasons: [...evaluation.reasons, "Atomic budget reservation rejected the action"],
+        },
+      }));
+      if (this.onBundleEmitted) await this.onBundleEmitted(reservationBundle);
+      const error: any = new Error("[Veridex x402] Budget reservation failed: would exceed daily spending limit");
+      error.evidenceBundle = reservationBundle;
+      throw error;
     }
 
     let txHash: string | undefined;
@@ -785,6 +911,15 @@ export class VeridexGoatX402Payer {
     let committed = false;
     let broadcastUncertain = false;
     try {
+      if (challenge.scheme !== "exact") {
+        if (!security.paymentAuthorizer) {
+          throw new Error(`[Veridex x402] Scheme '${challenge.scheme}' requires a payer authorization submitter`);
+        }
+        const authorization = await security.paymentAuthorizer({ action: normalizedAction, challenge });
+        if (authorization?.authorized !== true) {
+          throw new Error("[Veridex x402] Merchant did not accept the payer authorization");
+        }
+      }
       if (walletAdapter && typeof walletAdapter.sendTransaction === "function") {
         const execution = TransactionDecoder.buildExecutionRequest(normalizedAction);
         const res = await walletAdapter.sendTransaction({ ...execution, _normalizedAction: normalizedAction });

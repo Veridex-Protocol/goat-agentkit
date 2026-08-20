@@ -9,6 +9,8 @@ import {
   VeridexPolicyGate,
   InMemoryX402NonceStore,
   canonicalX402Challenge,
+  TransactionDecoder,
+  registerAsset,
 } from "../src/index.js";
 import { ethers } from "ethers";
 import * as fs from "fs";
@@ -166,6 +168,7 @@ describe("GOAT Network ERC-8004 & x402 Integration Spec", () => {
       accepts: "USDC",
       priceUSDC: "2500000",
       amountUSD: 2.5,
+      payer: "0x1111111111111111111111111111111111111111",
       payTo: "0x9a7c3f5b2e8d14a6c0f9e7b2d5a8f1c3b4d6e0a2",
       chain: 30,
       scheme: "authorization",
@@ -206,6 +209,7 @@ describe("GOAT Network ERC-8004 & x402 Integration Spec", () => {
       accepts: "USDC",
       amount: "2500000",
       amountUSD: 2.5,
+      payer: "0x1111111111111111111111111111111111111111",
       payTo: "0x9a7c3f5b2e8d14a6c0f9e7b2d5a8f1c3b4d6e0a2",
       chain: 30,
       scheme: "authorization" as const,
@@ -218,20 +222,24 @@ describe("GOAT Network ERC-8004 & x402 Integration Spec", () => {
       tokenAddress: "0x2222222222222222222222222222222222222222",
     };
     challenge.signature = await merchant.signMessage(canonicalX402Challenge(challenge));
-    const normalizedAction: any = Object.freeze({
-      actionId: ethers.id("integration-bound-action"), chainId: 30,
-      from: "0x1111111111111111111111111111111111111111", to: challenge.payTo,
-      value: 2500000n, assetType: "erc20", symbol: "USDC",
-      tokenAddress: "0x2222222222222222222222222222222222222222", calldataSelector: "0xa9059cbb",
-      decimals: 6, priceUSD: 1, usdValue: 2.5,
-      priceUSDMicros: 1000000n, usdMicros: 2500000n,
-      priceUpdatedAt: Math.floor(Date.now() / 1000), priceSource: "test",
+    registerAsset(30, {
+      symbol: "USDC", decimals: 6, native: false, tokenAddress: challenge.tokenAddress,
+      priceUSD: 1, priceUSDMicros: 1_000_000n,
+      priceUpdatedAt: Math.floor(Date.now() / 1000), priceSource: "test:fixed", maxPriceAgeSeconds: 300,
+    });
+    const normalizedAction = TransactionDecoder.decodeAndNormalize({
+      chainId: 30,
+      from: "0x1111111111111111111111111111111111111111",
+      to: challenge.payTo,
+      rawValue: challenge.amount,
+      asset: "USDC",
     });
 
     const res = await payer.executeX402Payment(challenge, normalizedAction, mockWallet, {
       nonceStore: new InMemoryX402NonceStore(),
       allowedMerchants: new Set([merchant.address.toLowerCase()]),
       allowedMerchantOrigins: new Set([challenge.merchantOrigin]),
+      paymentAuthorizer: async () => ({ authorized: true as const }),
       settlementVerifier: {
         verify: async ({ txHash }: any) => ({
           txHash, status: 1, chain: 30, blockNumber: 1, blockHash: ethers.id("block"),

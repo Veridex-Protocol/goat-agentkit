@@ -35,13 +35,21 @@ export class PhalaDstackAttestationProvider implements AttestationProvider {
 
       if (response.ok) {
         const json: any = await response.json();
+        const quote = json.quote || json.attestation || json.token;
+        if (typeof quote !== "string" || quote.length === 0 || quote.length > 2 * 1024 * 1024) {
+          throw new Error("[Phala TEE Driver] dstack response did not contain a bounded quote");
+        }
         if (process.env.NODE_ENV === "production") {
           throw new Error("[Phala TEE Driver] Quote verification is not implemented; refusing production evidence.");
         }
+        const declaredMeasurement = json.mrEnclave || json.measurement;
+        const measurement = typeof declaredMeasurement === "string" && /^0x[0-9a-fA-F]{64,128}$/.test(declaredMeasurement)
+          ? declaredMeasurement
+          : "0x0000000000000000000000000000000000000000000000000000000000000000";
         return {
           provider: "phala-dstack",
-          quote: json.quote || json.attestation || json.token,
-          measurement: json.mrEnclave || json.measurement || "0x3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d",
+          quote,
+          measurement,
           boundHash,
           timestamp,
           verificationStatus: "unverified: dstack quote signature and measurement were not verified",
@@ -58,7 +66,7 @@ export class PhalaDstackAttestationProvider implements AttestationProvider {
     return {
       provider: "software",
       quote: "LIVE_PHALA_DSTACK_UNAVAILABLE_LOCAL_ENV",
-      measurement: "0x3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d",
+      measurement: "0x0000000000000000000000000000000000000000000000000000000000000000",
       boundHash,
       timestamp,
       verificationStatus: "unverified: dstack unavailable (software fallback)",

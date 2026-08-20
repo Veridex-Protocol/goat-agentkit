@@ -31,13 +31,21 @@ export class NillionSecretVaultAttestationProvider implements AttestationProvide
 
       if (response.ok) {
         const json: any = await response.json();
+        const quote = json.mpcProof || json.quote;
+        if (typeof quote !== "string" || quote.length === 0 || quote.length > 2 * 1024 * 1024) {
+          throw new Error("[Nillion TEE Driver] vault response did not contain a bounded proof");
+        }
         if (process.env.NODE_ENV === "production") {
           throw new Error("[Nillion TEE Driver] MPC proof verification is not implemented; refusing production evidence.");
         }
+        const declaredMeasurement = json.clusterMeasurement;
+        const measurement = typeof declaredMeasurement === "string" && /^0x[0-9a-fA-F]{64,128}$/.test(declaredMeasurement)
+          ? declaredMeasurement
+          : "0x0000000000000000000000000000000000000000000000000000000000000000";
         return {
           provider: "nillion-secret-vault",
-          quote: json.mpcProof || json.quote || "NILLION_SECRET_VAULT_PROOF",
-          measurement: json.clusterMeasurement || "0x9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1f0e",
+          quote,
+          measurement,
           boundHash,
           timestamp,
           verificationStatus: "unverified: vault proof and measurement were not verified",
@@ -54,7 +62,7 @@ export class NillionSecretVaultAttestationProvider implements AttestationProvide
     return {
       provider: "software",
       quote: "LIVE_NILLION_VAULT_UNAVAILABLE_LOCAL_ENV",
-      measurement: "0x9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1f0e",
+      measurement: "0x0000000000000000000000000000000000000000000000000000000000000000",
       boundHash,
       timestamp,
       verificationStatus: "unverified: vault unavailable (software fallback)",

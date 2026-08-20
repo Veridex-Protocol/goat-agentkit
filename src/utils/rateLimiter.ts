@@ -13,13 +13,16 @@ export class RateLimiter {
   private limits: Map<string, RateLimitEntry> = new Map();
   private maxRequests: number;
   private windowMs: number;
+  private cleanupTimer: ReturnType<typeof setInterval>;
 
   constructor(maxRequests = 100, windowMs = 60_000) {
     this.maxRequests = maxRequests;
     this.windowMs = windowMs;
 
     // Cleanup expired entries every minute
-    setInterval(() => this.cleanup(), 60_000);
+    this.cleanupTimer = setInterval(() => this.cleanup(), 60_000);
+    // Importing the SDK must not keep a CLI/test process alive indefinitely.
+    this.cleanupTimer.unref?.();
   }
 
   /**
@@ -67,6 +70,10 @@ export class RateLimiter {
    */
   public reset(key: string): void {
     this.limits.delete(key);
+  }
+
+  public close(): void {
+    clearInterval(this.cleanupTimer);
   }
 
   /**

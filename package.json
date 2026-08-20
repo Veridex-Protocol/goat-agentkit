@@ -32,19 +32,21 @@
     "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
     "test": "vitest run",
     "lint": "tsc --noEmit",
+    "registry:verify-artifact": "npm run build --silent && node scripts/verifyRegistryArtifact.js",
     "clean": "rm -rf dist"
   },
   "dependencies": {
-    "ethers": "^6.10.0",
-    "pg": "^8.20.0",
-    "zod": "^3.22.4"
+    "@aws-sdk/client-kms": "3.1115.0",
+    "ethers": "6.17.0",
+    "pg": "8.23.0",
+    "zod": "3.25.76"
   },
   "devDependencies": {
-    "@types/node": "^20.0.0",
-    "@types/pg": "^8.11.0",
+    "@types/node": "20.19.43",
+    "@types/pg": "8.21.0",
     "solc": "0.8.20",
-    "tsup": "^8.0.0",
-    "typescript": "^5.0.0",
+    "tsup": "8.5.1",
+    "typescript": "5.9.3",
     "vitest": "4.1.11"
   },
   "overrides": {
@@ -61,6 +63,6 @@
     "evidence-bundle"
   ],
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   }
 }

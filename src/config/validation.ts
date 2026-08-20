@@ -17,9 +17,9 @@ export function validateBootConfiguration(env: Record<string, string | undefined
   const isPlaceholder = (value: string | undefined) => !value || /REPLACE_WITH|CHANGE_ME|PLACEHOLDER/i.test(value);
 
   // 1. Validate Evidence Registry address
-  const registryAddr = env.EVIDENCE_REGISTRY_ADDRESS || GOAT_ERC8004_ADDRESSES.testnet3.evidenceRegistry;
+  const registryAddr = env.EVIDENCE_REGISTRY_ADDRESS || (isProduction ? undefined : GOAT_ERC8004_ADDRESSES.testnet3.evidenceRegistry);
   if (!registryAddr || registryAddr === "0x0000000000000000000000000000000000000000") {
-    errors.push("EVIDENCE_REGISTRY_ADDRESS cannot be zero or empty");
+    errors.push("EVIDENCE_REGISTRY_ADDRESS must explicitly identify the reviewed registry");
   }
   if (isProduction && !addressPattern.test(registryAddr || "")) {
     errors.push("EVIDENCE_REGISTRY_ADDRESS must be an EVM address");
@@ -102,6 +102,15 @@ export function validateBootConfiguration(env: Record<string, string | undefined
     if (!addressPattern.test(env.USDC_TOKEN_ADDRESS || "") || !addressPattern.test(env.USDC_USD_ORACLE_ADDRESS || "")) {
       errors.push("USDC_TOKEN_ADDRESS and USDC_USD_ORACLE_ADDRESS are required for the production x402 showcase");
     }
+    const rpcEndpoints = (env.GOAT_NETWORK_RPC_URLS || env.GOAT_NETWORK_RPC || "")
+      .split(",").map((value) => value.trim()).filter(Boolean);
+    try {
+      if (rpcEndpoints.length === 0 || rpcEndpoints.some((value) => new URL(value).protocol !== "https:")) {
+        errors.push("At least one explicitly configured HTTPS GOAT RPC endpoint is required in production");
+      }
+    } catch {
+      errors.push("GOAT RPC endpoint configuration contains an invalid URL");
+    }
     const confirmations = Number(env.X402_MIN_CONFIRMATIONS || "0");
     if (!Number.isSafeInteger(confirmations) || confirmations < 1 || confirmations > 64) {
       errors.push("X402_MIN_CONFIRMATIONS must be an integer between 1 and 64");
@@ -153,8 +162,10 @@ export function validateBootConfiguration(env: Record<string, string | undefined
       errors.push("GOAT_ACTION_MANIFEST_SHA256 is required to pin AgentKit tool metadata");
     }
     if (env.CLOUD_MODE === "true" && (!env.AZURE_MAA_TRUSTED_ISSUERS || !env.AZURE_MAA_AUDIENCE ||
-        !env.AZURE_MAA_TRUSTED_ROOT_FINGERPRINTS || !env.AZURE_MAA_ALLOWED_MEASUREMENTS)) {
-      errors.push("Verified Azure MAA mode requires pinned issuers, audience, root fingerprints, and measurements");
+        !env.AZURE_MAA_TRUSTED_ROOT_FINGERPRINTS || !env.AZURE_MAA_ALLOWED_MEASUREMENTS ||
+        !env.AZURE_MAA_ALLOWED_TCB_STATUSES || !env.AZURE_MAA_ALLOWED_PRODUCTS ||
+        !/^\d+$/.test(env.AZURE_MAA_MIN_GUEST_SVN || ""))) {
+      errors.push("Verified Azure MAA mode requires pinned issuers, audience, roots, measurements, products, TCB statuses, and minimum guest SVN");
     }
     for (const [name, value] of Object.entries({
       INTERNAL_AGENT_HMAC_SECRET: env.INTERNAL_AGENT_HMAC_SECRET,

@@ -36,6 +36,10 @@ function key(symbol: string): string {
 }
 
 export function registerAsset(chainId: number, def: AssetDefinition): void {
+  if (!Number.isSafeInteger(chainId) || chainId <= 0 || !/^[A-Za-z0-9]{2,16}$/.test(def.symbol) ||
+      !Number.isSafeInteger(def.decimals) || def.decimals < 0 || def.decimals > 36) {
+    throw new Error("[AssetRegistry] chain, symbol, and decimals must be canonical");
+  }
   if (!Number.isFinite(def.priceUSD) || def.priceUSD <= 0 || def.priceUSD > 1_000_000_000) {
     throw new Error(`[AssetRegistry] ${def.symbol} priceUSD must be finite and positive`);
   }
@@ -61,16 +65,23 @@ export function registerAsset(chainId: number, def: AssetDefinition): void {
   if (!ASSET_REGISTRY.has(chainId)) {
     ASSET_REGISTRY.set(chainId, new Map());
   }
-  ASSET_REGISTRY.get(chainId)!.set(key(def.symbol), {
+  const normalizedSymbol = key(def.symbol);
+  const normalizedToken = def.tokenAddress ? ethers.getAddress(def.tokenAddress) : null;
+  const existing = ASSET_REGISTRY.get(chainId)!.get(normalizedSymbol);
+  if (existing && (existing.native !== def.native || existing.decimals !== def.decimals ||
+      existing.tokenAddress !== normalizedToken)) {
+    throw new Error(`[AssetRegistry] Refusing to change the on-chain identity of ${normalizedSymbol} on chain ${chainId}`);
+  }
+  ASSET_REGISTRY.get(chainId)!.set(normalizedSymbol, Object.freeze({
     ...def,
     priceUSD: Number(priceUSDMicros) / 1_000_000,
     priceUSDMicros,
-    symbol: key(def.symbol),
-    tokenAddress: def.tokenAddress ? ethers.getAddress(def.tokenAddress) : null,
+    symbol: normalizedSymbol,
+    tokenAddress: normalizedToken,
     priceUpdatedAt,
     priceSource,
     maxPriceAgeSeconds,
-  });
+  }));
 }
 
 export function getAssetDefinition(chainId: number, symbol: string): AssetDefinition | undefined {
@@ -125,6 +136,68 @@ const ERC20_INTERFACE = new ethers.Interface([
 const ERC20_TRANSFER_SELECTOR = ERC20_INTERFACE.getFunction("transfer")!.selector;
 
 /**
+ * Re-derive every policy-relevant field from the trusted asset registry. A
+ * TypeScript object is not a security boundary: callers can otherwise forge a
+ * low `usdValue` while keeping transaction bytes that move a much larger value.
+ */
+export function assertNormalizedActionIntegrity(action: NormalizedAction): void {
+  if (!action || typeof action !== "object" || !Object.isFrozen(action)) {
+    throw new Error("ACTION_BINDING_ERROR: normalized action must be an immutable decoder result");
+  }
+  if (!Number.isSafeInteger(action.chainId) || action.chainId <= 0 || typeof action.value !== "bigint" || action.value < 0n) {
+    throw new Error("ACTION_BINDING_ERROR: normalized chain or value is invalid");
+  }
+  const symbol = key(action.symbol);
+  const asset = getAssetDefinition(action.chainId, symbol);
+  if (!asset) throw new Error(`ACTION_BINDING_ERROR: ${symbol} is not registered on chain ${action.chainId}`);
+  const from = ethers.getAddress(action.from);
+  const recipient = ethers.getAddress(action.to);
+  const expectedAssetType = asset.native ? "native" : "erc20";
+  const expectedToken = asset.tokenAddress ? ethers.getAddress(asset.tokenAddress) : null;
+  const suppliedToken = action.tokenAddress ? ethers.getAddress(action.tokenAddress) : null;
+  if (action.assetType !== expectedAssetType || suppliedToken !== expectedToken || action.decimals !== asset.decimals) {
+    throw new Error("ACTION_BINDING_ERROR: normalized asset identity does not match the trusted registry");
+  }
+  if (action.priceUSDMicros !== asset.priceUSDMicros || action.priceUpdatedAt !== asset.priceUpdatedAt ||
+      action.priceSource !== asset.priceSource) {
+    throw new Error("ACTION_BINDING_ERROR: normalized valuation is not the current trusted registry snapshot");
+  }
+  const now = Math.floor(Date.now() / 1000);
+  if (action.priceUpdatedAt > now + 30 || now - action.priceUpdatedAt > asset.maxPriceAgeSeconds!) {
+    throw new Error("ACTION_BINDING_ERROR: normalized valuation is stale or future-dated");
+  }
+  const expectedUsdMicros = (action.value * asset.priceUSDMicros!) / (10n ** BigInt(asset.decimals));
+  if (expectedUsdMicros > BigInt(Number.MAX_SAFE_INTEGER) || action.usdMicros !== expectedUsdMicros ||
+      action.usdValue !== Number(expectedUsdMicros) / 1_000_000 ||
+      action.priceUSD !== Number(asset.priceUSDMicros!) / 1_000_000) {
+    throw new Error("ACTION_BINDING_ERROR: normalized USD valuation was forged or corrupted");
+  }
+  const expectedSelector = asset.native ? "0x00000000" :
+    (action.calldataSelector === "0x00000000" ? "0x00000000" : ERC20_TRANSFER_SELECTOR);
+  if (action.calldataSelector !== expectedSelector) {
+    throw new Error("ACTION_BINDING_ERROR: normalized selector is not an exact transfer");
+  }
+  if (action.rawCalldata && action.rawCalldata !== "0x") {
+    if (asset.native || action.rawCalldata.toLowerCase() !==
+        ERC20_INTERFACE.encodeFunctionData("transfer", [recipient, action.value]).toLowerCase()) {
+      throw new Error("ACTION_BINDING_ERROR: normalized raw calldata is not the canonical transfer");
+    }
+  }
+  const expectedActionId = ethers.id([
+    action.chainId,
+    from.toLowerCase(),
+    recipient.toLowerCase(),
+    asset.native ? "native" : expectedToken!.toLowerCase(),
+    action.value.toString(),
+    action.calldataSelector,
+    symbol,
+  ].join(":"));
+  if (action.actionId.toLowerCase() !== expectedActionId.toLowerCase()) {
+    throw new Error("ACTION_BINDING_ERROR: normalized action identifier is invalid");
+  }
+}
+
+/**
  * Verifies that a transaction request is the exact request represented by a
  * NormalizedAction. This is intentionally narrow: an action which cannot be
  * represented exactly must be rejected rather than approximated by policy.
@@ -133,6 +206,7 @@ export function assertExecutionMatchesNormalizedAction(
   action: NormalizedAction,
   request: { to?: string; value?: bigint | string | number; data?: string }
 ): void {
+  assertNormalizedActionIntegrity(action);
   const expected = TransactionDecoder.buildExecutionRequest(action);
   if (!request.to || ethers.getAddress(request.to) !== ethers.getAddress(expected.to)) {
     throw new Error("ACTION_BINDING_ERROR: transaction recipient/contract does not match normalized action");
@@ -298,6 +372,7 @@ export class TransactionDecoder {
    * contract with zero native value.
    */
   public static buildExecutionRequest(action: NormalizedAction): { to: string; value: bigint; data: string } {
+    assertNormalizedActionIntegrity(action);
     if (action.assetType === "native") {
       return { to: action.to, value: action.value, data: "0x" };
     }

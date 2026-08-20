@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ethers } from "ethers";
 import {
   EvmRpcSettlementVerifier,
+  buildX402PaymentAuthorization,
   canonicalX402Challenge,
   type NormalizedAction,
   type X402Challenge,
@@ -45,6 +46,7 @@ function challenge(bound: NormalizedAction): X402Challenge {
     accepts: bound.symbol,
     amount: bound.value.toString(),
     amountUSD: bound.usdValue,
+    payer: bound.from,
     payTo: bound.to,
     chain: bound.chainId,
     scheme: "exact",
@@ -116,6 +118,15 @@ describe("RPC-backed x402 settlement verification", () => {
       .rejects.toThrow("payer");
   });
 
+  it("rejects an invoice bound to another payer before reading the chain", async () => {
+    const bound = action("native");
+    await expect(new EvmRpcSettlementVerifier(providerFor(bound), 1).verify({
+      txHash,
+      action: bound,
+      challenge: { ...challenge(bound), payer: recipient },
+    })).rejects.toThrow("challenge");
+  });
+
   it("merchant signatures bind the complete V2 order identity", async () => {
     const merchant = ethers.Wallet.createRandom();
     const bound = action("native");
@@ -125,5 +136,30 @@ describe("RPC-backed x402 settlement verification", () => {
     const original = canonicalX402Challenge(signed);
     expect(canonicalX402Challenge({ ...signed, resource: "dataset:other" })).not.toBe(original);
     expect(canonicalX402Challenge({ ...signed, orderId: "ord_other_order" })).not.toBe(original);
+    expect(canonicalX402Challenge({ ...signed, payer: recipient })).not.toBe(original);
+  });
+
+  it("binds the payer authorization to the exact invoice with EIP-712", async () => {
+    const payerWallet = ethers.Wallet.createRandom();
+    const bound = Object.freeze({ ...action("erc20"), from: payerWallet.address });
+    const invoice = challenge(bound);
+    const authorization = buildX402PaymentAuthorization(invoice);
+    const signature = await payerWallet.signTypedData(
+      authorization.domain,
+      authorization.types as any,
+      authorization.value,
+    );
+    expect(ethers.verifyTypedData(
+      authorization.domain,
+      authorization.types as any,
+      authorization.value,
+      signature,
+    )).toBe(payerWallet.address);
+    expect(ethers.verifyTypedData(
+      authorization.domain,
+      authorization.types as any,
+      { ...authorization.value, amount: "2500001" },
+      signature,
+    )).not.toBe(payerWallet.address);
   });
 });

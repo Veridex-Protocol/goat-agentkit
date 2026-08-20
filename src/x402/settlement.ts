@@ -52,6 +52,15 @@ export class EvmRpcSettlementVerifier implements X402SettlementVerifier {
   }): Promise<VerifiedX402Settlement> {
     const { txHash, action, challenge } = params;
     if (!/^0x[a-fA-F0-9]{64}$/.test(txHash)) throw new Error("Settlement transaction hash is malformed");
+    const challengeToken = challenge.tokenAddress ? ethers.getAddress(challenge.tokenAddress) : null;
+    const actionToken = action.tokenAddress ? ethers.getAddress(action.tokenAddress) : null;
+    if (ethers.getAddress(challenge.payer) !== ethers.getAddress(action.from) ||
+        ethers.getAddress(challenge.payTo) !== ethers.getAddress(action.to) ||
+        challenge.chain !== action.chainId ||
+        challenge.accepts.toUpperCase() !== action.symbol.toUpperCase() ||
+        challenge.amount !== action.value.toString() || challengeToken !== actionToken) {
+      throw new Error("Settlement challenge does not match the normalized action");
+    }
 
     const [network, receipt, transaction, latestBlock] = await Promise.all([
       this.provider.getNetwork(),

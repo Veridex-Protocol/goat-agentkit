@@ -17,6 +17,7 @@ import {
   LocalSessionSigner,
   TransactionDecoder,
   registerAsset,
+  sanitizePolicyState,
 } from "../src/index";
 import { canonicalX402Challenge, InMemoryX402NonceStore, verifyX402Challenge } from "../src/x402/goatX402";
 import { SessionRevocationList } from "../src/session/revocation";
@@ -139,6 +140,14 @@ describe("VRD-2026-001: normalized action semantic binding", () => {
     expect(() => TransactionDecoder.decodeAndNormalize({
       from, to: "0x4444444444444444444444444444444444444444", data, asset: "USDC", chainId,
     })).toThrow("does not match allowlisted");
+  });
+
+  it("rejects a frozen caller-forged valuation even when execution bytes match", () => {
+    const legitimate = TransactionDecoder.decodeAndNormalize({
+      from, to: recipient, humanAmount: "25", asset: "USDC", chainId,
+    });
+    const forged = Object.freeze({ ...legitimate, usdValue: 0.000001, usdMicros: 1n });
+    expect(() => TransactionDecoder.buildExecutionRequest(forged)).toThrow("valuation was forged");
   });
 });
 
@@ -454,6 +463,7 @@ describe("VD-GOAT-008: x402 challenge verification", () => {
       accepts: "USDC",
       amount: "2500000",
       amountUSD: 2.5,
+      payer: "0x1111111111111111111111111111111111111111",
       payTo: "0x1234567890123456789012345678901234567890",
       chain: 48816,
       scheme: "authorization" as const,
@@ -483,6 +493,7 @@ describe("VD-GOAT-008: x402 challenge verification", () => {
       accepts: "USDC",
       amount: "2500000",
       amountUSD: 2.5,
+      payer: "0x1111111111111111111111111111111111111111",
       payTo: "0x1234567890123456789012345678901234567890",
       chain: 48816,
       scheme: "authorization" as const,
@@ -515,6 +526,7 @@ describe("VD-GOAT-008: x402 challenge verification", () => {
       accepts: "USDC",
       amount: "2500000",
       amountUSD: 2.5,
+      payer: "0x1111111111111111111111111111111111111111",
       payTo: "0x1234567890123456789012345678901234567890",
       chain: 48816,
       scheme: "authorization" as const,
@@ -658,6 +670,11 @@ describe("VD-GOAT-011: Atomic state persistence", () => {
 
     const loaded = stateFile.read();
     expect(loaded).toEqual(state);
+  });
+
+  it("strict durable-state parsing rejects a partial/corrupt spend ledger", () => {
+    expect(() => sanitizePolicyState({ dailySpendUSD: 0 } as any, true))
+      .toThrow("strict structural validation");
   });
 });
 
