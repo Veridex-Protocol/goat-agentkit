@@ -1,131 +1,96 @@
 # `@veridex/goat-agentkit`
 
-> **Verifiable Economic Policy Enforcement & ERC-8004 Validation Artifacts for GOAT Network AgentKit**
+Security and evidence controls for GOAT Network AgentKit: exact transaction normalization, atomic economic policy, authenticated x402 challenges, RPC-backed settlement verification, KMS session signing, and ERC-8004 evidence.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Network: GOAT Testnet3](https://img.shields.io/badge/Network-GOAT_Testnet3-cyan.svg)](https://explorer.testnet3.goat.network)
-[![Standard: ERC-8004](https://img.shields.io/badge/Standard-ERC--8004-purple.svg)](https://eips.ethereum.org)
+## Production invariants
 
-`@veridex/goat-agentkit` provides an in-path Economic Policy Enforcement Engine and ERC-8004 Evidence Verification layer for autonomous AI agents operating on GOAT Network.
+- A value-bearing operation must carry one immutable `NormalizedAction`. Caller-provided USD values, token labels, calldata semantics, or browser signatures are never authorization inputs.
+- Production policy reservations, spend accounting, replay nonces, and session revocation require transactional shared providers.
+- x402 success requires a complete merchant-signed V2 challenge and an RPC-verified mined transaction matching payer, chain, recipient/token contract, raw amount, calldata or native value, ERC-20 transfer log, and confirmation depth.
+- Direct wallet-wrapper success evidence requires an independent `transactionVerifier` in production.
+- EvidenceRegistry v3 separates evidence signers from gas-paying anchorers and binds the exact immutable storage URI in its EIP-712 authorization.
+- Exportable session/relayer keys, unverified TEE claims, stale prices, unsigned metadata, and silent state resets fail closed in production.
 
----
-
-## 🌟 Key Features
-
-1. **🛡️ Pre-Signature Economic Policy Gate (< 1ms)**:
-   - Enforces per-transaction limits, daily spending caps, velocity ceilings, allowed asset lists, and real-time counterparty denylists **before private keys touch transaction bytes** (`0% key touch` on policy rejection).
-
-2. **📜 Signed ERC-8004 Evidence Bundles**:
-   - Automatically emits cryptographically signed evidence bundles carrying the agent's `agentId`, policy decision, trace hash, Session Key signature, and optional TEE attestation quotes.
-
-3. **🔗 On-Chain Proof Anchoring**:
-   - Anchors evidence trace hashes directly to `EvidenceRegistry.sol` on GOAT Network Testnet3 (`0x40D9B16094808Fa48e73598E31AB964Cf15b475f`).
-
-4. **⚡ Zero-Dependency Cryptographic Verifier**:
-   - Proof verification requires zero Veridex SDK dependencies — verify any evidence bundle using native `ecrecover` in standard `ethers.js` or `viem`.
-
----
-
-## 📦 Installation
+## Install
 
 ```bash
 npm install @veridex/goat-agentkit ethers
-# or
-bun add @veridex/goat-agentkit ethers
 ```
 
----
+## Normalize once, then enforce and execute the same action
 
-## 🚀 Quickstart
+```ts
+import {
+  TransactionDecoder,
+  VeridexPolicyGate,
+  assertExecutionMatchesNormalizedAction,
+} from "@veridex/goat-agentkit";
 
-### 1. Initialize Policy Rules & Wrap GOAT AgentKit Wallet
-
-```typescript
-import { wrapWalletAdapter, VeridexPolicyGate } from "@veridex/goat-agentkit";
-
-// Define Economic Mandate Rules
-const policyRules = {
-  spendingLimits: {
-    maxPerTxUSD: 50,      // Max $50 USD per transaction
-    maxDailyUSD: 500,     // Max $500 USD total daily velocity
-  },
-  velocityLimit: {
-    maxTxPerHour: 60,     // Max 60 transactions/hour
-  },
-  sanctionedRecipients: [
-    "0xBlockedAddress123...",
-  ],
-  allowedAssets: ["BTC", "USDC", "GOAT", "USDT"],
-};
-
-// Wrap your GOAT AgentKit Wallet Adapter
-const veridexWallet = wrapWalletAdapter(goatWalletAdapter, {
-  agentId: "erc8004:48816:1042",
-  policyRules,
-  teeAttestationEnabled: true,
-  onBundleEmitted: (bundle) => {
-    console.log("Signed Evidence Bundle Hash:", bundle.traceHash);
-    console.log("On-Chain Explorer Link:", bundle.onChainExplorerUrl);
-  },
+const action = TransactionDecoder.decodeAndNormalize({
+  chainId: 48816,
+  from: payerAddress,
+  to: merchantAddress,
+  asset: "USDC",
+  rawValue: "20000000",
 });
+
+const evaluation = await policyGate.evaluate(action);
+if (evaluation.verdict !== "pass") throw new Error(evaluation.reasons.join(", "));
+
+const request = TransactionDecoder.buildExecutionRequest(action);
+assertExecutionMatchesNormalizedAction(action, request);
 ```
 
----
+Register ERC-20 contracts and fresh trusted prices before decoding. The demo uses pinned on-chain oracle feeds and stores exact USD-micros values.
 
-## 🔐 Zero-Dependency Evidence Verification
+## Real x402 payer interception
 
-Anyone can verify an ERC-8004 evidence bundle off-chain using `@veridex/goat-agentkit` or standard `ethers.js` v6:
+```ts
+import {
+  EvmRpcSettlementVerifier,
+  PostgresX402NonceStore,
+  wrapX402PaymentActions,
+} from "@veridex/goat-agentkit";
 
-### Using the SDK Verifier:
-```typescript
-import { verifyEvidenceBundle } from "@veridex/goat-agentkit";
-
-const isValid = await verifyEvidenceBundle(bundle);
-console.log("Evidence bundle signature and trace validity:", isValid);
-```
-
-### Or using vanilla `ethers.js` (EIP-712 Typed Data Verification):
-```typescript
-import { ethers } from "ethers";
-
-const domain = {
-  name: "Veridex Evidence Registry",
-  version: "2",
-  chainId: bundle.evidence.chainId,
-  verifyingContract: bundle.evidence.registryAddress,
-};
-
-const types = {
-  EvidenceTrace: [
-    { name: "agentId", type: "string" },
-    { name: "traceHash", type: "bytes32" },
-    { name: "bundleHash", type: "bytes32" },
-    { name: "sessionSigner", type: "address" },
-    { name: "timestamp", type: "uint256" },
-  ],
-};
-
-const recoveredSigner = ethers.verifyTypedData(
-  domain,
-  types,
-  bundle.evidence,
-  bundle.signature
+const secured = wrapX402PaymentActions(
+  paymentActions,
+  policyGate,
+  kmsSessionSigner,
+  agentId,
+  persistEvidence,
+  {
+    allowedMerchants: new Set([merchantSigner.toLowerCase()]),
+    allowedMerchantOrigins: new Set(["https://merchant.example"]),
+    nonceStore: new PostgresX402NonceStore(databaseUrl, agentId),
+    settlementVerifier: new EvmRpcSettlementVerifier(rpcProvider, 2),
+    sessionExpiresAt,
+    sessionRevocationProvider,
+    sessionAuthorizationVerifier,
+    approvalVerifier,
+    settlementNotifier,
+  },
 );
-
-console.log("Recovered Session Signer:", recoveredSigner);
 ```
 
----
+The wrapped spending action must broadcast the transaction derived from `_normalizedAction`. It must never recompute an amount from USD or return a synthetic hash.
 
-## 🛠️ Hardware KMS & Contract Deployment
+## Evidence verification
 
-### Deploying the EvidenceRegistry:
+Use `EvidenceBuilder.verifyBundle()` for cryptographic integrity only. For production authorization use `EvidenceBuilder.verifyBundleWithMandate(bundle, provider, registryAddress)`, which requires an immutable v3 registry record binding the recovered signer, agent, bundle hash, and storage URI.
+
+## Deployment
+
+Deploy [`contracts/EvidenceRegistry.sol`](./contracts/EvidenceRegistry.sol), transfer ownership to reviewed governance with the two-step handoff, configure distinct evidence-signer and anchorer roles, and pin the runtime bytecode hash, owner, chain, and v3 domain at service startup.
+
+See `examples/goat-demo` for the end-to-end GOAT `ActionProvider`/`ExecutionRuntime`, all five documented AI framework adapters, KMS-backed session rotation, dual approval, real merchant settlement, immutable evidence storage, and hardened deployment topology.
+
+## Verification
+
 ```bash
-AWS_KMS_KEY_ID="arn:aws:kms:..." npx tsx scripts/deployRegistry.ts
+npm ci --workspaces=false
+npm run lint
+npm test
+npm run build
 ```
 
----
-
-## 📄 License
-
-MIT © [Veridex Protocol](https://github.com/Veridex-Protocol)
+MIT © Veridex Protocol

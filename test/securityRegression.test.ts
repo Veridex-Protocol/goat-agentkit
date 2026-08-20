@@ -577,6 +577,24 @@ describe("VD-GOAT-009: Registry authorization", () => {
       signature,
     );
     expect(recovered).toBe(sessionSigner);
+    const tampered = ethers.verifyTypedData(
+      { name: "Veridex Evidence Registry", version: "3", chainId: 48816, verifyingContract },
+      {
+        EvidenceAuthorization: [
+          { name: "agentHash", type: "bytes32" },
+          { name: "bundleHash", type: "bytes32" },
+          { name: "sessionSigner", type: "address" },
+          { name: "storageUriHash", type: "bytes32" },
+          { name: "deadline", type: "uint256" },
+        ],
+      },
+      {
+        agentHash: ethers.id("erc8004:48816:1042"), bundleHash, sessionSigner,
+        storageUriHash: ethers.id("https://attacker.example/evidence.json"), deadline,
+      },
+      signature,
+    );
+    expect(tampered).not.toBe(sessionSigner);
   });
 
   it("should export registry initialization function via demo server", () => {

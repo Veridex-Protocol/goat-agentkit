@@ -132,7 +132,7 @@ export async function deployEvidenceRegistry(
   // intentionally performed from a compiled, reviewed Solidity artifact so
   // the code hash can be pinned in EVIDENCE_REGISTRY_CODE_HASH before startup.
   throw new Error(
-    "EvidenceRegistry v2 deployment requires the reviewed contracts/EvidenceRegistry.sol artifact; " +
+    "EvidenceRegistry v3 deployment requires the reviewed URI-bound contracts/EvidenceRegistry.sol artifact; " +
     "the legacy embedded bytecode is disabled. Pin and verify the deployed runtime code hash before enabling anchoring."
   );
 

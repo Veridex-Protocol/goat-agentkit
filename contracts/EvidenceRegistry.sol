@@ -3,11 +3,18 @@ pragma solidity ^0.8.20;
 
 /**
  * @title EvidenceRegistry
- * @notice Anchors evidence hashes with separate session-signing and gas-paying
- *         authorities. The v3 authorization binds the immutable storage URI.
+ * @notice Anchors Veridex Evidence Bundle hashes while separating the off-chain
+ *         evidence authority from the gas-paying anchor relayer.
+ *
+ * An anchorer may submit an already-signed bundle but cannot manufacture one:
+ * `recordEvidence` verifies a short-lived EIP-712 authorization signed by a
+ * separately allowlisted evidence signer. This fixes the v1 single-signer
+ * design, where setting a relayer as `authorizedSigner` made the anchored
+ * record falsely identify the relayer as the evidence authority.
  */
 contract EvidenceRegistry {
     address public owner;
+    address public pendingOwner;
 
     mapping(bytes32 => mapping(address => bool)) public authorizedEvidenceSigners;
     mapping(bytes32 => mapping(address => bool)) public authorizedAnchorers;
@@ -21,6 +28,8 @@ contract EvidenceRegistry {
 
     event EvidenceSignerSet(string indexed agentId, bytes32 indexed agentIdHash, address indexed signer, bool allowed);
     event AnchorerSet(string indexed agentId, bytes32 indexed agentIdHash, address indexed anchorer, bool allowed);
+    event OwnershipTransferStarted(address indexed previousOwner, address indexed pendingOwner);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event EvidenceRecorded(
         string indexed agentId,
         bytes32 indexed bundleHash,
@@ -51,6 +60,20 @@ contract EvidenceRegistry {
         _;
     }
 
+    function transferOwnership(address nextOwner) external onlyOwner {
+        require(nextOwner != address(0) && nextOwner != owner, "Invalid next owner");
+        pendingOwner = nextOwner;
+        emit OwnershipTransferStarted(owner, nextOwner);
+    }
+
+    function acceptOwnership() external {
+        require(msg.sender == pendingOwner, "Only pending owner can accept");
+        address previousOwner = owner;
+        owner = pendingOwner;
+        pendingOwner = address(0);
+        emit OwnershipTransferred(previousOwner, owner);
+    }
+
     function setEvidenceSigner(string calldata agentId, address signer, bool allowed) external onlyOwner {
         require(signer != address(0), "Signer cannot be zero address");
         bytes32 agentHash = keccak256(bytes(agentId));
@@ -58,6 +81,11 @@ contract EvidenceRegistry {
         emit EvidenceSignerSet(agentId, agentHash, signer, allowed);
     }
 
+    /**
+     * @notice Atomically hand evidence authority from one session key to the
+     * next. A sequence of separate allow/revoke transactions briefly leaves
+     * two keys trusted; this transition never does.
+     */
     function rotateEvidenceSigner(
         string calldata agentId,
         address previousSigner,
