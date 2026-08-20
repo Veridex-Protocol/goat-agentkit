@@ -18,7 +18,7 @@ import {
   TransactionDecoder,
   registerAsset,
 } from "../src/index";
-import { InMemoryX402NonceStore, verifyX402Challenge } from "../src/x402/goatX402";
+import { canonicalX402Challenge, InMemoryX402NonceStore, verifyX402Challenge } from "../src/x402/goatX402";
 import { SessionRevocationList } from "../src/session/revocation";
 import { RateLimiter } from "../src/utils/rateLimiter";
 import { canonicalizeJson } from "../src/evidence/builder";
@@ -449,6 +449,7 @@ describe("VD-GOAT-007: TEE JWT verification", () => {
 describe("VD-GOAT-008: x402 challenge verification", () => {
   it("should reject expired challenge", async () => {
     const challenge = {
+      version: "2" as const,
       status: 402,
       accepts: "USDC",
       amount: "2500000",
@@ -456,19 +457,28 @@ describe("VD-GOAT-008: x402 challenge verification", () => {
       payTo: "0x1234567890123456789012345678901234567890",
       chain: 48816,
       scheme: "authorization" as const,
-      nonce: "nonce123",
+      nonce: ethers.id("expired-nonce"),
       validBefore: Math.floor(Date.now() / 1000) - 3600, // expired
+      orderId: "ord_expired_123",
+      resource: "dataset:premium",
+      merchantOrigin: "https://merchant.example.com",
+      tokenAddress: "0x2222222222222222222222222222222222222222",
     };
 
-    const result = await verifyX402Challenge(challenge, {});
+    const result = await verifyX402Challenge(challenge, {
+      allowedMerchantOrigins: new Set(["https://merchant.example.com"]),
+    });
     expect(result.valid).toBe(false);
     expect(result.reason).toContain("future validBefore");
   });
 
   it("should reject nonce replay", async () => {
-    const usedNonces = new Set(["nonce123"]);
+    const merchant = ethers.Wallet.createRandom();
+    const nonce = ethers.id("replayed-nonce");
+    const usedNonces = new Set([nonce]);
 
-    const challenge = {
+    const challenge: any = {
+      version: "2" as const,
       status: 402,
       accepts: "USDC",
       amount: "2500000",
@@ -476,20 +486,31 @@ describe("VD-GOAT-008: x402 challenge verification", () => {
       payTo: "0x1234567890123456789012345678901234567890",
       chain: 48816,
       scheme: "authorization" as const,
-      nonce: "nonce123",
+      nonce,
       validBefore: Math.floor(Date.now() / 1000) + 3600,
+      orderId: "ord_replayed_123",
+      resource: "dataset:premium",
+      merchantOrigin: "https://merchant.example.com",
+      tokenAddress: "0x2222222222222222222222222222222222222222",
+      merchantPublicKey: merchant.address,
     };
+    challenge.signature = await merchant.signMessage(canonicalX402Challenge(challenge));
 
-    const result = await verifyX402Challenge(challenge, { usedNonces });
+    const result = await verifyX402Challenge(challenge, {
+      usedNonces,
+      allowedMerchants: new Set([merchant.address.toLowerCase()]),
+      allowedMerchantOrigins: new Set([challenge.merchantOrigin]),
+    });
     expect(result.valid).toBe(false);
-    expect(result.reason).toContain("merchant signature");
+    expect(result.reason).toContain("replay");
   });
 
   it("should accept a signed allowlisted challenge once and track its nonce", async () => {
     const merchant = ethers.Wallet.createRandom();
     const nonceStore = new InMemoryX402NonceStore();
 
-    const challenge = {
+    const challenge: any = {
+      version: "2" as const,
       status: 402,
       accepts: "USDC",
       amount: "2500000",
@@ -497,20 +518,28 @@ describe("VD-GOAT-008: x402 challenge verification", () => {
       payTo: "0x1234567890123456789012345678901234567890",
       chain: 48816,
       scheme: "authorization" as const,
-      nonce: "fresh-nonce-456",
-      validBefore: Math.floor(Date.now() / 1000) + 3600,
+      nonce: ethers.id("fresh-nonce-456"),
+      validBefore: Math.floor(Date.now() / 1000) + 300,
       merchantPublicKey: merchant.address,
+      orderId: "ord_fresh_456",
+      resource: "dataset:premium",
+      merchantOrigin: "https://merchant.example.com",
+      tokenAddress: "0x2222222222222222222222222222222222222222",
       signature: undefined as string | undefined,
     };
-    const message = JSON.stringify({ ...challenge, status: undefined, merchantPublicKey: undefined, signature: undefined });
-    challenge.signature = await merchant.signMessage(message);
+    challenge.signature = await merchant.signMessage(canonicalX402Challenge(challenge));
 
     const result = await verifyX402Challenge(challenge, {
       nonceStore,
       allowedMerchants: new Set([merchant.address.toLowerCase()]),
+      allowedMerchantOrigins: new Set([challenge.merchantOrigin]),
     });
     expect(result.valid).toBe(true);
-    expect((await verifyX402Challenge(challenge, { nonceStore, allowedMerchants: new Set([merchant.address.toLowerCase()]) })).reason).toContain("replay");
+    expect((await verifyX402Challenge(challenge, {
+      nonceStore,
+      allowedMerchants: new Set([merchant.address.toLowerCase()]),
+      allowedMerchantOrigins: new Set([challenge.merchantOrigin]),
+    })).reason).toContain("replay");
   });
 });
 
@@ -758,17 +787,13 @@ describe("VD-GOAT-015: No unsafe defaults in production", () => {
   });
 
   it("boot validation should reject zero address registry in production", () => {
-    const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {}) as any);
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
-    validateBootConfiguration({
+    expect(() => validateBootConfiguration({
       NODE_ENV: "production",
       EVIDENCE_REGISTRY_ADDRESS: "0x0000000000000000000000000000000000000000",
-    });
+    })).toThrow("Boot configuration rejected");
 
-    expect(exitSpy).toHaveBeenCalledWith(1);
-
-    exitSpy.mockRestore();
     errorSpy.mockRestore();
   });
 });

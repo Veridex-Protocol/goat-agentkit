@@ -394,12 +394,11 @@ export class EvidenceBuilder {
     }
 
     try {
-      // 3. Query the v2 registry's evidence-authority allowlist. The anchoring
-      // relayer is deliberately a different role and must never be mistaken
-      // for the signer that authorized this bundle.
-      const agentHash = ethers.id(bundle.trace.agentId);
+      // Query the immutable record created while the signer was authorized.
+      // Looking only at the current allowlist would invalidate historical
+      // evidence after a legitimate key rotation.
       const registryABI = [
-        "function authorizedEvidenceSigners(bytes32,address) view returns (bool)",
+        "function getEvidenceRecord(bytes32) view returns (tuple(string agentId, bytes32 bundleHash, address sessionSigner, uint256 timestamp, address anchorer, bool exists))",
       ];
       const registry = new ethers.Contract(registryAddress, registryABI, provider);
       const recoveredSigner = basicVerification.recoveredAddress;
@@ -410,14 +409,22 @@ export class EvidenceBuilder {
           mandateVerified: false,
         };
       }
-      const authorized = await registry.authorizedEvidenceSigners(agentHash, recoveredSigner);
-
-      // 4. Verify recovered signer is authorized on-chain
-      if (!authorized) {
+      const bundleHash = bundle.bundleHash || bundle.traceHash;
+      const record = await registry.getEvidenceRecord(bundleHash);
+      if (!record?.exists || String(record.bundleHash).toLowerCase() !== bundleHash.toLowerCase()) {
         return {
           valid: false,
           recoveredAddress: recoveredSigner,
-          reason: `Signer ${recoveredSigner} is not an authorized evidence signer for agent ${bundle.trace.agentId}`,
+          reason: `Bundle ${bundleHash} has no immutable registry record`,
+          mandateVerified: false,
+        };
+      }
+      if (record.agentId !== bundle.trace.agentId ||
+          ethers.getAddress(record.sessionSigner) !== ethers.getAddress(recoveredSigner)) {
+        return {
+          valid: false,
+          recoveredAddress: recoveredSigner,
+          reason: "Registry record does not bind this agent and recovered evidence signer",
           mandateVerified: false,
         };
       }

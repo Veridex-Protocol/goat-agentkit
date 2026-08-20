@@ -156,8 +156,14 @@ export class AzureMaaAttestationProvider implements AttestationProvider {
       }
       try {
         const issuerUrl = new URL(payload.iss);
-        if (issuerUrl.protocol !== "https:" || !issuerUrl.hostname.endsWith(".attest.azure.net")) {
-          return { verified: false, error: `Untrusted issuer: ${payload.iss} (must be https://*.attest.azure.net)` };
+        const trustedIssuers = process.env.AZURE_MAA_TRUSTED_ISSUERS;
+        if (strict && !trustedIssuers) {
+          return { verified: false, error: "AZURE_MAA_TRUSTED_ISSUERS is required when verified attestation is required" };
+        }
+        const allowlist = new Set((trustedIssuers || "").split(",").map((value) => value.trim()).filter(Boolean));
+        if (issuerUrl.protocol !== "https:" || issuerUrl.origin !== payload.iss ||
+            (allowlist.size > 0 && !allowlist.has(payload.iss))) {
+          return { verified: false, error: `Untrusted or non-canonical issuer: ${payload.iss}` };
         }
       } catch {
         return { verified: false, error: `Invalid issuer URL: ${payload.iss}` };
@@ -165,13 +171,22 @@ export class AzureMaaAttestationProvider implements AttestationProvider {
 
       // 2. Verify expiry
       const now = Math.floor(Date.now() / 1000);
-      if (payload.exp && payload.exp < now) {
+      if (!Number.isSafeInteger(payload.exp)) {
+        return { verified: false, error: "Missing or invalid expiry (exp) claim" };
+      }
+      if (payload.exp < now) {
         return { verified: false, error: `Token expired at ${payload.exp}, now ${now}` };
       }
 
       // 3. Verify not-before
-      if (payload.nbf && payload.nbf > now) {
+      if (!Number.isSafeInteger(payload.nbf) || payload.nbf > now + 30) {
         return { verified: false, error: `Token not yet valid, nbf: ${payload.nbf}, now ${now}` };
+      }
+      if (!Number.isSafeInteger(payload.iat) || payload.iat > now + 30 || now - payload.iat > 300) {
+        return { verified: false, error: "Missing, future, or stale issued-at (iat) claim" };
+      }
+      if (payload.exp - payload.iat > 600) {
+        return { verified: false, error: "Attestation token lifetime exceeds 10 minutes" };
       }
 
       // 4. Extract measurement
@@ -184,7 +199,8 @@ export class AzureMaaAttestationProvider implements AttestationProvider {
       if (strict && !expectedAudience) {
         return { verified: false, error: "AZURE_MAA_AUDIENCE is required when verified attestation is required" };
       }
-      if (expectedAudience && payload.aud !== expectedAudience) {
+      const audiences = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+      if (expectedAudience && !audiences.includes(expectedAudience)) {
         return { verified: false, error: `Audience mismatch: got ${payload.aud}, expected ${expectedAudience}` };
       }
 
@@ -198,6 +214,15 @@ export class AzureMaaAttestationProvider implements AttestationProvider {
             new X509Certificate(Buffer.from(encoded, "base64"))
           );
           const leaf = certificates[0];
+          const tokenTime = Date.now();
+          for (const certificate of certificates) {
+            const validFrom = new Date(certificate.validFrom).getTime();
+            const validTo = new Date(certificate.validTo).getTime();
+            if (!Number.isFinite(validFrom) || !Number.isFinite(validTo) || tokenTime < validFrom || tokenTime > validTo) {
+              throw new Error("x5c certificate is outside its validity interval");
+            }
+          }
+          if (leaf.ca) throw new Error("x5c leaf certificate must not be a CA");
 
           // Construct signed data (JWT header + payload)
           const signedData = `${parts[0]}.${parts[1]}`;
@@ -222,11 +247,21 @@ export class AzureMaaAttestationProvider implements AttestationProvider {
 
           if (signatureVerified && certificates.length >= 2) {
             for (let i = 0; i < certificates.length - 1; i++) {
+              if (!certificates[i + 1].ca) {
+                signatureVerified = false;
+                signatureError = `x5c issuer certificate ${i + 1} is not a CA`;
+                break;
+              }
               if (!certificates[i].verify(certificates[i + 1].publicKey)) {
                 signatureVerified = false;
                 signatureError = `x5c certificate chain validation failed at certificate ${i}`;
                 break;
               }
+            }
+            const root = certificates[certificates.length - 1];
+            if (signatureVerified && !root.verify(root.publicKey)) {
+              signatureVerified = false;
+              signatureError = "x5c root certificate is not self-signed";
             }
             const configuredRoots = process.env.AZURE_MAA_TRUSTED_ROOT_FINGERPRINTS;
             if (signatureVerified && strict && !configuredRoots) {
@@ -260,7 +295,11 @@ export class AzureMaaAttestationProvider implements AttestationProvider {
           payload["x-ms-runtime"]?.["user-data"] ||
           payload["nonce"] ||
           payload["runtime_data"]?.["user-data"];
-        const norm = (s: string) => s.toLowerCase().replace(/^0x/, "");
+        const norm = (s: string) => {
+          const raw = String(s);
+          if (/^(0x)?[a-fA-F0-9]+$/.test(raw)) return raw.toLowerCase().replace(/^0x/, "");
+          try { return Buffer.from(raw, "base64url").toString("hex").toLowerCase(); } catch { return raw.toLowerCase(); }
+        };
         const want = norm(expectedBoundHash);
         if (!reportData) {
           signatureVerified = false;
@@ -287,7 +326,7 @@ export class AzureMaaAttestationProvider implements AttestationProvider {
       }
 
       return {
-        measurement: measurement ? `0x${measurement}` : undefined,
+        measurement: measurement ? `0x${String(measurement).replace(/^0x/, "")}` : undefined,
         certChain: header.x5c || undefined,
         verified: signatureVerified,
         error: signatureVerified ? undefined : signatureError,

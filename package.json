@@ -45,7 +45,11 @@
     "solc": "0.8.20",
     "tsup": "^8.0.0",
     "typescript": "^5.0.0",
-    "vitest": "^1.0.0"
+    "vitest": "4.1.11"
+  },
+  "overrides": {
+    "esbuild": "0.28.1",
+    "tmp": "0.2.7"
   },
   "keywords": [
     "goat-network",

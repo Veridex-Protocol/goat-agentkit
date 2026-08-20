@@ -3,13 +3,16 @@ import { VeridexPolicyGate, type PolicyStateProvider } from "../policy/gate.js";
 import { PolicyRuleConfig } from "../policy/rules.js";
 import { EvidenceBuilder, EvidenceBundle } from "../evidence/builder.js";
 import { LocalSessionSigner, SessionSigner } from "../evidence/signer.js";
-import { HumanApprovalRequiredError } from "../wrapper.js";
+import { HumanApprovalRequiredError, SessionExpiredError } from "../wrapper.js";
 import { x402RateLimiter } from "../utils/rateLimiter.js";
 import type { NormalizedAction } from "../types/action.js";
 import { TransactionDecoder } from "../policy/decoder.js";
 import { Pool, type PoolConfig } from "pg";
+import type { SessionRevocationProvider } from "../session/revocation.js";
+import type { VerifiedX402Settlement, X402SettlementVerifier } from "./settlement.js";
 
 export interface X402Challenge {
+  version: "2";
   status: number;
   message?: string;
   accepts: string; // e.g. "USDC" or "GOAT"
@@ -23,6 +26,69 @@ export interface X402Challenge {
   validBefore?: number;
   signature?: string; // VD-GOAT-008: Merchant signature over challenge
   merchantPublicKey?: string; // VD-GOAT-008: Merchant's signing key
+  /** Merchant-generated, globally unique order identity. */
+  orderId: string;
+  /** Canonical resource or invoice URI purchased by this settlement. */
+  resource: string;
+  /** HTTPS origin independently allowlisted by the payer. */
+  merchantOrigin: string;
+  /** Exact ERC-20 contract, or null for native currency. */
+  tokenAddress: string | null;
+}
+
+export interface X402ExecutionSecurity {
+  allowedMerchants?: Set<string>;
+  allowedMerchantOrigins?: Set<string>;
+  usedNonces?: Set<string>;
+  nonceStore?: X402NonceStore;
+  settlementVerifier?: X402SettlementVerifier;
+  sessionExpiresAt?: number;
+  sessionRevocationProvider?: SessionRevocationProvider;
+  /**
+   * Binds the evidence signer to the configured agent identity. Production
+   * callers normally implement this with the pinned ERC-8004 EvidenceRegistry.
+   */
+  sessionAuthorizationVerifier?: (params: {
+    sessionAddress: string;
+    agentId: string;
+  }) => boolean | Promise<boolean>;
+  /**
+   * Called only after the transaction has been independently verified and the
+   * policy reservation has been committed. A failed merchant callback can
+   * therefore never make already-spent funds disappear from policy state.
+   */
+  settlementNotifier?: (params: {
+    settlement: VerifiedX402Settlement;
+    action: NormalizedAction;
+    challenge: X402Challenge;
+    result: unknown;
+  }) => Promise<{ confirmed: boolean; receipt?: unknown; error?: string }>;
+  /** Durable decision lookup for escalated exact invoice executions. */
+  approvalVerifier?: (params: {
+    approvalId: string;
+    action: NormalizedAction;
+    challenge: X402Challenge;
+    context?: unknown;
+  }) => Promise<boolean>;
+}
+
+export function canonicalX402Challenge(challenge: X402Challenge): string {
+  return JSON.stringify({
+    version: challenge.version,
+    orderId: challenge.orderId,
+    resource: challenge.resource,
+    merchantOrigin: challenge.merchantOrigin,
+    accepts: challenge.accepts,
+    tokenAddress: challenge.tokenAddress,
+    amount: challenge.amount,
+    amountUSD: challenge.amountUSD,
+    payTo: challenge.payTo,
+    chain: challenge.chain,
+    scheme: challenge.scheme,
+    nonce: challenge.nonce,
+    validAfter: challenge.validAfter,
+    validBefore: challenge.validBefore,
+  });
 }
 
 export interface EIP3009Authorization {
@@ -153,6 +219,7 @@ export function parseX402Challenge(responseHeaders: Record<string, string>, resp
         throw new Error("[Veridex x402 Challenge] Cannot determine payment USD value: amountUSD is missing from the challenge data.");
       }
       return {
+        version: decoded.version,
         status: 402,
         accepts: decoded.accepts || "USDC",
         amount: String(decoded.amount || decoded.priceUSDC || "0"),
@@ -165,6 +232,10 @@ export function parseX402Challenge(responseHeaders: Record<string, string>, resp
       validBefore: decoded.validBefore,
         signature: decoded.signature, // VD-GOAT-008: Merchant signature
         merchantPublicKey: decoded.merchantPublicKey, // VD-GOAT-008: Merchant's key
+        orderId: decoded.orderId,
+        resource: decoded.resource,
+        merchantOrigin: decoded.merchantOrigin,
+        tokenAddress: decoded.tokenAddress ?? null,
       };
     } catch (e: any) {
       if (e.message && e.message.includes("Cannot determine payment USD value")) {
@@ -180,6 +251,7 @@ export function parseX402Challenge(responseHeaders: Record<string, string>, resp
       throw new Error("[Veridex x402 Challenge] Cannot determine payment USD value: amountUSD is missing from the challenge body.");
     }
     return {
+      version: responseBody.version,
       status: 402,
       accepts: responseBody.accepts || "USDC",
       amount: String(responseBody.priceUSDC || responseBody.amount || "0"),
@@ -192,6 +264,10 @@ export function parseX402Challenge(responseHeaders: Record<string, string>, resp
       validBefore: responseBody.validBefore,
       signature: responseBody.signature, // VD-GOAT-008: Merchant signature
       merchantPublicKey: responseBody.merchantPublicKey, // VD-GOAT-008: Merchant's key
+      orderId: responseBody.orderId,
+      resource: responseBody.resource,
+      merchantOrigin: responseBody.merchantOrigin,
+      tokenAddress: responseBody.tokenAddress ?? null,
     };
   }
 
@@ -217,11 +293,53 @@ export async function verifyX402Challenge(
     usedNonces?: Set<string>;
     allowedMerchants?: Set<string>;
     nonceStore?: X402NonceStore;
+    allowedMerchantOrigins?: Set<string>;
+    consumeNonce?: boolean;
   }
 ): Promise<{ valid: boolean; reason?: string }> {
   const now = Math.floor(Date.now() / 1000);
+  if (challenge.version !== "2") return { valid: false, reason: "Unsupported x402 challenge version" };
+  if (challenge.status !== 402) return { valid: false, reason: "x402 challenge status must be 402" };
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(challenge.orderId || "")) {
+    return { valid: false, reason: "Missing or malformed merchant orderId" };
+  }
+  if (typeof challenge.resource !== "string" || challenge.resource.length < 1 || challenge.resource.length > 2048) {
+    return { valid: false, reason: "Missing or malformed x402 resource" };
+  }
+  let merchantOrigin: string;
+  try {
+    const parsedOrigin = new URL(challenge.merchantOrigin);
+    if (parsedOrigin.protocol !== "https:" && process.env.NODE_ENV === "production") {
+      return { valid: false, reason: "Merchant origin must use HTTPS in production" };
+    }
+    merchantOrigin = parsedOrigin.origin;
+    if (merchantOrigin !== challenge.merchantOrigin) return { valid: false, reason: "Merchant origin must be canonical" };
+  } catch {
+    return { valid: false, reason: "Merchant origin is invalid" };
+  }
+  if (!options.allowedMerchantOrigins || !options.allowedMerchantOrigins.has(merchantOrigin)) {
+    return { valid: false, reason: `Untrusted merchant origin: ${merchantOrigin}` };
+  }
   if (!challenge.nonce || typeof challenge.nonce !== "string") {
     return { valid: false, reason: "Missing replay-protection nonce" };
+  }
+  if (!/^0x[a-fA-F0-9]{64}$/.test(challenge.nonce)) {
+    return { valid: false, reason: "Replay-protection nonce must be bytes32" };
+  }
+  if (!/^\d+$/.test(challenge.amount) || BigInt(challenge.amount) <= 0n) {
+    return { valid: false, reason: "Challenge amount must be a positive base-unit integer" };
+  }
+  if (!Number.isFinite(challenge.amountUSD) || challenge.amountUSD! < 0) {
+    return { valid: false, reason: "Challenge amountUSD is invalid" };
+  }
+  if (!Number.isSafeInteger(challenge.chain) || challenge.chain <= 0) {
+    return { valid: false, reason: "Challenge chain is invalid" };
+  }
+  try {
+    ethers.getAddress(challenge.payTo);
+    if (challenge.tokenAddress) ethers.getAddress(challenge.tokenAddress);
+  } catch {
+    return { valid: false, reason: "Challenge payment address is invalid" };
   }
   if (!challenge.validBefore || !Number.isInteger(challenge.validBefore) || challenge.validBefore <= now) {
     return { valid: false, reason: "Challenge is missing a future validBefore timestamp" };
@@ -238,12 +356,12 @@ export async function verifyX402Challenge(
   if (!options.allowedMerchants || options.allowedMerchants.size === 0) {
     return { valid: false, reason: "No merchant allowlist configured" };
   }
-  if (!options.nonceStore && !options.usedNonces) {
+  if (options.consumeNonce !== false && !options.nonceStore && !options.usedNonces) {
     return { valid: false, reason: "No nonce store configured" };
   }
 
   // 1. Verify nonce freshness (prevent replay)
-  if (challenge.nonce && options.usedNonces) {
+  if (options.consumeNonce !== false && challenge.nonce && options.usedNonces) {
     if (options.usedNonces.has(challenge.nonce)) {
       return { valid: false, reason: `Nonce replay detected: ${challenge.nonce}` };
     }
@@ -251,18 +369,7 @@ export async function verifyX402Challenge(
 
   // 2. Verify merchant signature against an independently configured identity.
   try {
-      // Construct canonical challenge message
-      const message = JSON.stringify({
-        accepts: challenge.accepts,
-        amount: challenge.amount,
-        amountUSD: challenge.amountUSD,
-        payTo: challenge.payTo,
-        chain: challenge.chain,
-        scheme: challenge.scheme,
-        nonce: challenge.nonce,
-        validAfter: challenge.validAfter,
-        validBefore: challenge.validBefore,
-      });
+      const message = canonicalX402Challenge(challenge);
 
       const messageHash = ethers.hashMessage(message);
       const recoveredAddress = ethers.recoverAddress(messageHash, challenge.signature);
@@ -288,10 +395,10 @@ export async function verifyX402Challenge(
 
   // Mark nonce as consumed only after all signature and policy-independent
   // checks pass. A durable nonceStore is required for production callers.
-  if (options.nonceStore && !await options.nonceStore.consume(challenge.nonce, challenge.validBefore)) {
+  if (options.consumeNonce !== false && options.nonceStore && !await options.nonceStore.consume(challenge.nonce, challenge.validBefore)) {
     return { valid: false, reason: `Nonce replay detected: ${challenge.nonce}` };
   }
-  if (challenge.nonce && options.usedNonces) {
+  if (options.consumeNonce !== false && challenge.nonce && options.usedNonces) {
     options.usedNonces.add(challenge.nonce);
   }
 
@@ -321,16 +428,14 @@ export function wrapX402PaymentActions(
   sessionSigner?: SessionSigner,
   agentId: string = "erc8004:48816:1042",
   onBundleEmitted?: (bundle: EvidenceBundle) => void,
-  options?: {
-    allowedMerchants?: Set<string>;
-    usedNonces?: Set<string>;
-    nonceStore?: X402NonceStore;
-  }
+  options?: X402ExecutionSecurity,
 ): ActionDefinition[] {
   const signer = sessionSigner || new LocalSessionSigner();
   const usedNonces = options?.usedNonces || new Set<string>();
   const allowedMerchants = options?.allowedMerchants;
+  const allowedMerchantOrigins = options?.allowedMerchantOrigins;
   const nonceStore = options?.nonceStore;
+  const settlementVerifier = options?.settlementVerifier;
 
   const actionList: ActionDefinition[] = Array.isArray(actions)
     ? actions
@@ -355,7 +460,11 @@ export function wrapX402PaymentActions(
         if (!challenge) {
           throw new Error(`[Veridex x402 Actions] Authenticated x402 challenge is required for '${action.name}'.`);
         }
-        const verification = await verifyX402Challenge(challenge, { usedNonces, allowedMerchants, nonceStore });
+        const sessionAddr = await signer.getAddress();
+        await assertX402SessionActive(sessionAddr, agentId, options);
+        const verification = await verifyX402Challenge(challenge, {
+          usedNonces, allowedMerchants, allowedMerchantOrigins, nonceStore, consumeNonce: false,
+        });
         if (!verification.valid) {
           throw new Error(`[Veridex x402 Actions] Challenge verification failed: ${verification.reason}`);
         }
@@ -370,12 +479,12 @@ export function wrapX402PaymentActions(
           challenge.chain !== chain ||
           challenge.accepts.toUpperCase() !== asset.toUpperCase() ||
           challenge.amount !== amount ||
-          challenge.amountUSD !== amountUSD
+          (challenge.tokenAddress ? ethers.getAddress(challenge.tokenAddress) : null) !==
+            (normalized.tokenAddress ? ethers.getAddress(normalized.tokenAddress) : null)
         ) {
           throw new Error("[Veridex x402 Actions] Challenge does not describe the exact normalized action.");
         }
 
-        const sessionAddr = await signer.getAddress();
         const sessionKeyHash = ethers.id(sessionAddr);
         const evidenceBuilder = new EvidenceBuilder(agentId, sessionKeyHash);
 
@@ -409,8 +518,15 @@ export function wrapX402PaymentActions(
           };
         }
 
-        // 2b. Pre-Signature Enforcement Gate: Escalation
-        if (evaluation.verdict === "escalate") {
+        const actionId = ethers.id(`${normalized.actionId}:${challenge.orderId}:${challenge.nonce}`);
+
+        // 2b. Pre-Signature Enforcement Gate: Escalation. A durable approval
+        // lookup may authorize this exact order/action pair; a boolean supplied
+        // in the request body is never trusted.
+        const approved = evaluation.verdict === "escalate" && options?.approvalVerifier
+          ? await options.approvalVerifier({ approvalId: actionId, action: normalized, challenge, context })
+          : false;
+        if (evaluation.verdict === "escalate" && !approved) {
           const escalationBundle = evidenceBuilder.buildDenial({
             payload: { to: recipient, amount, asset, chain },
             evaluation,
@@ -424,6 +540,7 @@ export function wrapX402PaymentActions(
             status: "PENDING_APPROVAL",
             blocked: true,
             verdict: "escalate",
+            approvalId: actionId,
             reasons: evaluation.reasons,
             evidenceBundle: signedBundle,
             error: `[Veridex Policy Gate] Payment requires human approval: ${evaluation.reasons.join(", ")}`,
@@ -432,7 +549,13 @@ export function wrapX402PaymentActions(
 
         // VRD-2026-007 fix: Atomically reserve budget BEFORE the external action so
         // two concurrent x402 requests cannot both pass the same daily cap.
-        const actionId = normalized.actionId;
+        // Consume the durable nonce immediately before reservation/execution.
+        // Pending approvals therefore do not burn an invoice, while concurrent
+        // approved attempts still have exactly one winner.
+        const consumed = await verifyX402Challenge(challenge, {
+          usedNonces, allowedMerchants, allowedMerchantOrigins, nonceStore, consumeNonce: true,
+        });
+        if (!consumed.valid) throw new Error(`[Veridex x402] Challenge consumption failed: ${consumed.reason}`);
         const reserved = await policyGate.reserve(actionId, amountUSD);
         if (!reserved) {
           return {
@@ -446,28 +569,42 @@ export function wrapX402PaymentActions(
         // 3. Delegate to original action execution.
         let result: any;
         let txHash: string | undefined;
+        let settlement: VerifiedX402Settlement | undefined;
+        let merchantConfirmation: { confirmed: boolean; receipt?: unknown; error?: string } = {
+          confirmed: options?.settlementNotifier ? false : true,
+        };
         let committed = false;
         try {
           result = await action.execute(input, context);
-          const settlement = result?.settlementReceipt;
-          txHash = settlement?.txHash;
-          if (
-            !settlement ||
-            !/^0x[a-fA-F0-9]{64}$/.test(txHash || "") ||
-            settlement.status !== 1 ||
-            settlement.chain !== normalized.chainId
-          ) {
-            return {
-              status: "UNSETTLED",
-              result,
-              error: "[Veridex x402] Action did not return a verified settlement receipt for the normalized chain. No success evidence was produced.",
-            };
+          txHash = typeof result?.txHash === "string" ? result.txHash : result?.settlementReceipt?.txHash;
+          if (!txHash || !settlementVerifier) {
+            throw new Error("[Veridex x402] An RPC-backed settlement verifier and transaction hash are required");
           }
+          settlement = await settlementVerifier.verify({ txHash, action: normalized, challenge });
 
           // Convert the reservation into a committed spend now that the
           // transaction actually broadcast.
           await policyGate.commit(amountUSD, evaluation.evaluatedAt, actionId);
           committed = true;
+
+          if (options?.settlementNotifier) {
+            try {
+              merchantConfirmation = await options.settlementNotifier({
+                settlement,
+                action: normalized,
+                challenge,
+                result,
+              });
+            } catch (error: any) {
+              // The on-chain transfer is final and the spend is already
+              // committed. Surface a retryable merchant-confirmation state;
+              // never roll back policy accounting for an external callback.
+              merchantConfirmation = {
+                confirmed: false,
+                error: error?.message || "Merchant settlement notification failed",
+              };
+            }
+          }
         } finally {
           // VRD-2026-007 fix: release the reservation on ANY non-committed exit
           // (throw, missing hash) so failures never leak budget.
@@ -489,9 +626,11 @@ export function wrapX402PaymentActions(
         }
 
         return {
-          status: "SUCCESS",
+          status: merchantConfirmation.confirmed ? "SUCCESS" : "MERCHANT_CONFIRMATION_PENDING",
           result,
           txHash,
+          settlementReceipt: settlement,
+          merchantConfirmation,
           evidenceBundle: signedSuccessBundle,
         };
       },
@@ -507,6 +646,7 @@ export class VeridexGoatX402Payer {
   private sessionSigner: SessionSigner;
   private agentId: string;
   private onBundleEmitted?: (bundle: EvidenceBundle) => void;
+  private security?: X402ExecutionSecurity;
 
   constructor(params: {
     agentId: string;
@@ -514,22 +654,20 @@ export class VeridexGoatX402Payer {
     sessionSigner?: SessionSigner;
     onBundleEmitted?: (bundle: EvidenceBundle) => void;
     policyStateProvider?: PolicyStateProvider;
+    security?: X402ExecutionSecurity;
   }) {
     this.agentId = params.agentId;
     this.policyGate = new VeridexPolicyGate(params.policyRules, params.policyStateProvider);
     this.sessionSigner = params.sessionSigner || new LocalSessionSigner();
     this.onBundleEmitted = params.onBundleEmitted;
+    this.security = params.security;
   }
 
   public async executeX402Payment(
     challenge: X402Challenge,
     normalizedAction: NormalizedAction,
     walletAdapter: any,
-    verificationOptions?: {
-      usedNonces?: Set<string>;
-      allowedMerchants?: Set<string>;
-      nonceStore?: X402NonceStore;
-    }
+    verificationOptions?: X402ExecutionSecurity,
   ): Promise<{
     authorization?: EIP3009Authorization;
     txHash?: string;
@@ -540,6 +678,7 @@ export class VeridexGoatX402Payer {
       usedNonces: verificationOptions?.usedNonces,
       allowedMerchants: verificationOptions?.allowedMerchants,
       nonceStore: verificationOptions?.nonceStore,
+      allowedMerchantOrigins: verificationOptions?.allowedMerchantOrigins,
     });
     if (!verification.valid) {
       throw new Error(`[Veridex x402] Challenge verification failed: ${verification.reason}`);
@@ -550,13 +689,15 @@ export class VeridexGoatX402Payer {
       challenge.chain !== normalizedAction.chainId ||
       challenge.accepts.toUpperCase() !== normalizedAction.symbol.toUpperCase() ||
       challenge.amount !== normalizedAction.value.toString() ||
-      challenge.amountUSD !== normalizedAction.usdValue
+      (challenge.tokenAddress ? ethers.getAddress(challenge.tokenAddress) : null) !==
+        (normalizedAction.tokenAddress ? ethers.getAddress(normalizedAction.tokenAddress) : null)
     ) {
       throw new Error("[Veridex x402] Challenge does not match the immutable normalized action.");
     }
     const amountUSD = normalizedAction.usdValue;
 
     const sessionAddr = await this.sessionSigner.getAddress();
+    await assertX402SessionActive(sessionAddr, this.agentId, verificationOptions || this.security);
     const sessionKeyHash = ethers.id(sessionAddr);
     const evidenceBuilder = new EvidenceBuilder(this.agentId, sessionKeyHash);
 
@@ -608,22 +749,23 @@ export class VeridexGoatX402Payer {
 
     // VRD-2026-007 fix: reserve budget atomically, execute in try/finally, and
     // release on any non-committed exit.
-    const actionId = normalizedAction.actionId;
+    const actionId = ethers.id(`${normalizedAction.actionId}:${challenge.orderId}:${challenge.nonce}`);
     const reserved = await this.policyGate.reserve(actionId, amountUSD);
     if (!reserved) {
       throw new Error("[Veridex x402] Budget reservation failed: would exceed daily spending limit");
     }
 
     let txHash: string | undefined;
+    let settlement: VerifiedX402Settlement | undefined;
+    let merchantConfirmation: { confirmed: boolean; receipt?: unknown; error?: string } = {
+      confirmed: verificationOptions?.settlementNotifier || this.security?.settlementNotifier ? false : true,
+    };
     let committed = false;
     try {
       if (walletAdapter && typeof walletAdapter.sendTransaction === "function") {
         const execution = TransactionDecoder.buildExecutionRequest(normalizedAction);
         const res = await walletAdapter.sendTransaction({ ...execution, _normalizedAction: normalizedAction });
         txHash = typeof res === "string" ? undefined : res?.hash;
-        if (!res || typeof res === "string" || res?.receipt?.status !== 1 || res.receipt?.chain !== normalizedAction.chainId) {
-          throw new Error("[Veridex x402] Wallet adapter did not return a verified settlement receipt for the normalized action.");
-        }
       }
 
       if (!txHash) {
@@ -633,9 +775,22 @@ export class VeridexGoatX402Payer {
         );
       }
 
+      const settlementVerifier = verificationOptions?.settlementVerifier || this.security?.settlementVerifier;
+      if (!settlementVerifier) throw new Error("[Veridex x402] RPC-backed settlement verifier is required");
+      settlement = await settlementVerifier.verify({ txHash, action: normalizedAction, challenge });
+
       // Convert reservation to committed spend now that the tx broadcast.
       await this.policyGate.commit(amountUSD, evaluation.evaluatedAt, actionId);
       committed = true;
+
+      const notifier = verificationOptions?.settlementNotifier || this.security?.settlementNotifier;
+      if (notifier) {
+        try {
+          merchantConfirmation = await notifier({ settlement, action: normalizedAction, challenge, result: { txHash } });
+        } catch (error: any) {
+          merchantConfirmation = { confirmed: false, error: error?.message || "Merchant settlement notification failed" };
+        }
+      }
     } finally {
       if (!committed) {
         await this.policyGate.releaseReservation(actionId);
@@ -662,5 +817,29 @@ export class VeridexGoatX402Payer {
       txHash,
       evidenceBundle: signedBundle,
     };
+  }
+}
+
+async function assertX402SessionActive(
+  sessionAddress: string,
+  agentId: string,
+  security?: X402ExecutionSecurity,
+): Promise<void> {
+  if (!security?.sessionExpiresAt) {
+    if (process.env.NODE_ENV === "production") throw new Error("[Veridex x402] Session expiry is required in production");
+  } else if (Date.now() > security.sessionExpiresAt) {
+    throw new SessionExpiredError(sessionAddress, security.sessionExpiresAt);
+  }
+  if (!security?.sessionRevocationProvider) {
+    if (process.env.NODE_ENV === "production") throw new Error("[Veridex x402] Durable session revocation is required in production");
+  } else if (await security.sessionRevocationProvider.isRevoked(sessionAddress, agentId)) {
+    throw new Error(`[Veridex x402] Session key ${sessionAddress} is revoked`);
+  }
+  if (!security?.sessionAuthorizationVerifier) {
+    if (process.env.NODE_ENV === "production") {
+      throw new Error("[Veridex x402] Session-to-agent authorization verification is required in production");
+    }
+  } else if (!await security.sessionAuthorizationVerifier({ sessionAddress, agentId })) {
+    throw new Error(`[Veridex x402] Session key ${sessionAddress} is not authorized for agent ${agentId}`);
   }
 }

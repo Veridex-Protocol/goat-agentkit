@@ -425,6 +425,10 @@ export class VeridexPolicyGate {
   public async commit(amountUSD: number, evaluatedAt: number = Date.now(), actionId?: string): Promise<void> {
     if (!Number.isFinite(amountUSD) || amountUSD < 0) throw new Error("INVALID_COMMIT: amountUSD is invalid.");
     await this.mutate(() => {
+      // Reconciliation workers may observe the same mined transaction more than
+      // once. A content-bound action ID makes commit exactly-once rather than
+      // incrementing daily spend and velocity on every retry.
+      if (actionId && this.processedActionIds.has(actionId)) return;
       const currentDay = Math.floor(evaluatedAt / 86400000);
       if (currentDay !== this.lastSpendResetDay) {
         this.dailySpendUSD = 0;
@@ -437,6 +441,7 @@ export class VeridexPolicyGate {
         this.processedActionIds.add(actionId);
       } else {
         this.dailySpendUSD += amountUSD;
+        if (actionId) this.processedActionIds.add(actionId);
       }
       this.lastTxTimestamp = evaluatedAt;
     });

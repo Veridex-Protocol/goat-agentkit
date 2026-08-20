@@ -28,6 +28,11 @@ export const NormalizedActionSchema = z.object({
   decimals: z.number().int().min(0).max(36),
   priceUSD: z.number().nonnegative(),
   usdValue: z.number().nonnegative(),
+  /** Exact fixed-point USD valuation (six decimal places). */
+  priceUSDMicros: z.bigint().nonnegative(),
+  usdMicros: z.bigint().nonnegative(),
+  priceUpdatedAt: z.number().int().positive(),
+  priceSource: z.string().min(1),
   rawCalldata: z.string().optional(),
 });
 

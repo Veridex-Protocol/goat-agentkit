@@ -8,6 +8,7 @@ import {
   GoatERC8004Client,
   VeridexPolicyGate,
   InMemoryX402NonceStore,
+  canonicalX402Challenge,
 } from "../src/index.js";
 import { ethers } from "ethers";
 import * as fs from "fs";
@@ -160,6 +161,7 @@ describe("GOAT Network ERC-8004 & x402 Integration Spec", () => {
   it("should parse x402 payment challenges from merchant HTTP responses", () => {
     const mockHeaders = {};
     const mockResponseBody = {
+      version: "2",
       status: 402,
       accepts: "USDC",
       priceUSDC: "2500000",
@@ -167,6 +169,12 @@ describe("GOAT Network ERC-8004 & x402 Integration Spec", () => {
       payTo: "0x9a7c3f5b2e8d14a6c0f9e7b2d5a8f1c3b4d6e0a2",
       chain: 30,
       scheme: "authorization",
+      nonce: ethers.id("parsed-order"),
+      validBefore: Math.floor(Date.now() / 1000) + 300,
+      orderId: "ord_parsed_123",
+      resource: "dataset:premium",
+      merchantOrigin: "https://merchant.example.com",
+      tokenAddress: "0x2222222222222222222222222222222222222222",
     };
 
     const challenge = parseX402Challenge(mockHeaders, mockResponseBody);
@@ -193,6 +201,7 @@ describe("GOAT Network ERC-8004 & x402 Integration Spec", () => {
 
     const merchant = ethers.Wallet.createRandom();
     const challenge: any = {
+      version: "2",
       status: 402,
       accepts: "USDC",
       amount: "2500000",
@@ -200,26 +209,37 @@ describe("GOAT Network ERC-8004 & x402 Integration Spec", () => {
       payTo: "0x9a7c3f5b2e8d14a6c0f9e7b2d5a8f1c3b4d6e0a2",
       chain: 30,
       scheme: "authorization" as const,
-      nonce: "integration-nonce-1",
+      nonce: ethers.id("integration-nonce-1"),
       validBefore: Math.floor(Date.now() / 1000) + 300,
       merchantPublicKey: merchant.address,
+      orderId: "ord_integration_1",
+      resource: "dataset:premium",
+      merchantOrigin: "https://merchant.example.com",
+      tokenAddress: "0x2222222222222222222222222222222222222222",
     };
-    challenge.signature = await merchant.signMessage(JSON.stringify({
-      accepts: challenge.accepts, amount: challenge.amount, amountUSD: challenge.amountUSD,
-      payTo: challenge.payTo, chain: challenge.chain, scheme: challenge.scheme,
-      nonce: challenge.nonce, validAfter: challenge.validAfter, validBefore: challenge.validBefore,
-    }));
+    challenge.signature = await merchant.signMessage(canonicalX402Challenge(challenge));
     const normalizedAction: any = Object.freeze({
       actionId: ethers.id("integration-bound-action"), chainId: 30,
       from: "0x1111111111111111111111111111111111111111", to: challenge.payTo,
       value: 2500000n, assetType: "erc20", symbol: "USDC",
       tokenAddress: "0x2222222222222222222222222222222222222222", calldataSelector: "0xa9059cbb",
       decimals: 6, priceUSD: 1, usdValue: 2.5,
+      priceUSDMicros: 1000000n, usdMicros: 2500000n,
+      priceUpdatedAt: Math.floor(Date.now() / 1000), priceSource: "test",
     });
 
     const res = await payer.executeX402Payment(challenge, normalizedAction, mockWallet, {
       nonceStore: new InMemoryX402NonceStore(),
       allowedMerchants: new Set([merchant.address.toLowerCase()]),
+      allowedMerchantOrigins: new Set([challenge.merchantOrigin]),
+      settlementVerifier: {
+        verify: async ({ txHash }: any) => ({
+          txHash, status: 1, chain: 30, blockNumber: 1, blockHash: ethers.id("block"),
+          confirmations: 1, payer: normalizedAction.from, recipient: normalizedAction.to,
+          tokenAddress: normalizedAction.tokenAddress, amount: normalizedAction.value.toString(),
+          orderId: challenge.orderId, resource: challenge.resource, verifiedAt: Date.now(),
+        }),
+      },
     });
     expect(res.txHash).toBe("0x5d8e2c1a9f4b7306e2a5c1d9b3f80547a6e9c2b1d3f4a80c5e7b1d9a3f60528e");
     expect(res.evidenceBundle.verdict.verdict).toBe("pass");

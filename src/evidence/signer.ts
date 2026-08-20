@@ -1,10 +1,40 @@
-import { Wallet, id, TypedDataDomain, TypedDataField } from "ethers";
+import { Wallet, id, TypedDataDomain, TypedDataField, type Signer } from "ethers";
 import { EvidenceBundle } from "./builder.js";
 
 export interface SessionSigner {
   getAddress(): Promise<string>;
   signBundle(bundle: EvidenceBundle): Promise<EvidenceBundle>;
   signEvidenceAuthorization(params: EvidenceAuthorization): Promise<string>;
+}
+
+/** Adapts an HSM/KMS-backed ethers Signer without exporting key material. */
+export class EthersSessionSigner implements SessionSigner {
+  constructor(private readonly signer: Signer) {}
+
+  public async getAddress(): Promise<string> {
+    return this.signer.getAddress();
+  }
+
+  public async signBundle(bundle: EvidenceBundle): Promise<EvidenceBundle> {
+    const value = evidenceBundleValue(bundle);
+    bundle.signature = await this.signer.signTypedData(EVIDENCE_BUNDLE_DOMAIN, EVIDENCE_BUNDLE_TYPES, value);
+    return bundle;
+  }
+
+  public async signEvidenceAuthorization(params: EvidenceAuthorization): Promise<string> {
+    const expectedAddress = await this.getAddress();
+    validateEvidenceAuthorization(params, expectedAddress);
+    return this.signer.signTypedData(
+      {
+        name: "Veridex Evidence Registry",
+        version: "2",
+        chainId: params.chainId,
+        verifyingContract: params.verifyingContract,
+      },
+      EVIDENCE_AUTHORIZATION_TYPES,
+      evidenceAuthorizationValue(params),
+    );
+  }
 }
 
 /** EIP-712 delegation consumed by EvidenceRegistry v2 when a relayer anchors a bundle. */
@@ -81,15 +111,7 @@ export class LocalSessionSigner implements SessionSigner {
 
   public async signBundle(bundle: EvidenceBundle): Promise<EvidenceBundle> {
     // VD-GOAT-003 fix: Sign complete bundle envelope using EIP-712, not just traceHash
-    const value = {
-      traceHash: bundle.traceHash,
-      bundleHash: bundle.bundleHash || bundle.traceHash, // fallback for backward compat
-      agentId: bundle.trace?.agentId || "",
-      sessionKeyHash: bundle.trace?.sessionKeyHash || "0x0000000000000000000000000000000000000000000000000000000000000000",
-      settlementTxHash: bundle.settlementProof?.txHash || "0x0000000000000000000000000000000000000000000000000000000000000000",
-      storageContentId: bundle.storageReceipt?.contentId || "",
-      assembledAt: bundle.assembledAt || Date.now(),
-    };
+    const value = evidenceBundleValue(bundle);
 
     const signature = await this.wallet.signTypedData(
       EVIDENCE_BUNDLE_DOMAIN,
@@ -103,15 +125,7 @@ export class LocalSessionSigner implements SessionSigner {
 
   public async signEvidenceAuthorization(params: EvidenceAuthorization): Promise<string> {
     const expectedAddress = await this.getAddress();
-    if (expectedAddress.toLowerCase() !== params.sessionSigner.toLowerCase()) {
-      throw new Error("Evidence authorization must be signed by the declared session signer");
-    }
-    if (!/^0x[0-9a-fA-F]{64}$/.test(params.bundleHash)) {
-      throw new Error("Evidence authorization bundleHash must be a bytes32 value");
-    }
-    if (!Number.isSafeInteger(params.deadline) || params.deadline <= Math.floor(Date.now() / 1000)) {
-      throw new Error("Evidence authorization deadline must be a future Unix timestamp");
-    }
+    validateEvidenceAuthorization(params, expectedAddress);
     return this.wallet.signTypedData(
       {
         name: "Veridex Evidence Registry",
@@ -120,12 +134,40 @@ export class LocalSessionSigner implements SessionSigner {
         verifyingContract: params.verifyingContract,
       },
       EVIDENCE_AUTHORIZATION_TYPES,
-      {
-        agentHash: id(params.agentId),
-        bundleHash: params.bundleHash,
-        sessionSigner: params.sessionSigner,
-        deadline: params.deadline,
-      },
+      evidenceAuthorizationValue(params),
     );
   }
+}
+
+function evidenceBundleValue(bundle: EvidenceBundle) {
+  return {
+    traceHash: bundle.traceHash,
+    bundleHash: bundle.bundleHash || bundle.traceHash,
+    agentId: bundle.trace?.agentId || "",
+    sessionKeyHash: bundle.trace?.sessionKeyHash || "0x0000000000000000000000000000000000000000000000000000000000000000",
+    settlementTxHash: bundle.settlementProof?.txHash || "0x0000000000000000000000000000000000000000000000000000000000000000",
+    storageContentId: bundle.storageReceipt?.contentId || "",
+    assembledAt: bundle.assembledAt || Date.now(),
+  };
+}
+
+function validateEvidenceAuthorization(params: EvidenceAuthorization, expectedAddress: string): void {
+  if (expectedAddress.toLowerCase() !== params.sessionSigner.toLowerCase()) {
+    throw new Error("Evidence authorization must be signed by the declared session signer");
+  }
+  if (!/^0x[0-9a-fA-F]{64}$/.test(params.bundleHash)) {
+    throw new Error("Evidence authorization bundleHash must be a bytes32 value");
+  }
+  if (!Number.isSafeInteger(params.deadline) || params.deadline <= Math.floor(Date.now() / 1000)) {
+    throw new Error("Evidence authorization deadline must be a future Unix timestamp");
+  }
+}
+
+function evidenceAuthorizationValue(params: EvidenceAuthorization) {
+  return {
+    agentHash: id(params.agentId),
+    bundleHash: params.bundleHash,
+    sessionSigner: params.sessionSigner,
+    deadline: params.deadline,
+  };
 }

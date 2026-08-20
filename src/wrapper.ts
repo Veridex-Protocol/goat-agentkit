@@ -26,6 +26,8 @@ export interface SessionCreationOptions {
   durationSeconds?: number;
   policyRules: PolicyRuleConfig;
   privateKey?: string;
+  /** Preferred production path: KMS/HSM-backed signer with no exportable key. */
+  sessionSigner?: SessionSigner;
 }
 
 export interface ActiveSession {
@@ -64,7 +66,7 @@ export class SessionExpiredError extends Error {
  * High-level helper encapsulating session key derivation for GOAT AgentKit developers.
  */
 export async function createGoatAgentSession(options: SessionCreationOptions): Promise<ActiveSession> {
-  const signer = new LocalSessionSigner(options.privateKey);
+  const signer = options.sessionSigner || new LocalSessionSigner(options.privateKey);
   const address = await signer.getAddress();
   const durationSeconds = options.durationSeconds || 86400; // Default 24 hours
   const expiresAt = Date.now() + durationSeconds * 1000;

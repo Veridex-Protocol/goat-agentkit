@@ -21,8 +21,9 @@ export function validateBootConfiguration(env: Record<string, string | undefined
 
   // 2. In production, session key is REQUIRED (no random wallet fallback)
   const sessionKey = env.SESSION_KEY;
-  if (isProduction && !sessionKey) {
-    errors.push("SESSION_KEY is required in production (random wallet generation disabled)");
+  const sessionKmsKey = env.SESSION_AWS_KMS_KEY_ID;
+  if (isProduction && !sessionKmsKey) {
+    errors.push("SESSION_AWS_KMS_KEY_ID is required in production; exportable session keys are development-only");
   }
 
   if (sessionKey && !/^(0x)?[0-9a-fA-F]{64}$/.test(sessionKey.trim())) {
@@ -43,8 +44,9 @@ export function validateBootConfiguration(env: Record<string, string | undefined
 
   // 5. Validate PRIVATE_KEY/RELAYER key in production
   const privateKey = env.PRIVATE_KEY || env.RELAYER_PRIVATE_KEY;
-  if (isProduction && !privateKey) {
-    errors.push("PRIVATE_KEY or RELAYER_PRIVATE_KEY is required in production");
+  const relayerKmsKey = env.AWS_KMS_KEY_ID || env.KMS_KEY_ID;
+  if (isProduction && !relayerKmsKey) {
+    errors.push("AWS_KMS_KEY_ID is required in production; exportable relayer keys are development-only");
   }
   if (privateKey && !/^(0x)?[0-9a-fA-F]{64}$/.test(privateKey.trim())) {
     errors.push("PRIVATE_KEY or RELAYER_PRIVATE_KEY must be a valid 64-character hex private key");
@@ -76,6 +78,29 @@ export function validateBootConfiguration(env: Record<string, string | undefined
     if (env.GOAT_NETWORK === "mainnet" && !GOAT_ERC8004_ADDRESSES.mainnet.evidenceRegistry) {
       errors.push("Mainnet evidence registry not configured");
     }
+
+    if (!env.USDC_TOKEN_ADDRESS || !env.USDC_USD_ORACLE_ADDRESS) {
+      errors.push("USDC_TOKEN_ADDRESS and USDC_USD_ORACLE_ADDRESS are required for the production x402 showcase");
+    }
+    if (!env.X402_ALLOWED_MERCHANTS || !env.X402_ALLOWED_MERCHANT_ORIGINS) {
+      errors.push("X402_ALLOWED_MERCHANTS and X402_ALLOWED_MERCHANT_ORIGINS are required in production");
+    }
+    if (env.EVIDENCE_ANCHORING_ENABLED !== "true" || env.STRICT_REGISTRY !== "true") {
+      errors.push("Production evidence requires EVIDENCE_ANCHORING_ENABLED=true and STRICT_REGISTRY=true");
+    }
+    if (!env.EVIDENCE_REGISTRY_CODE_HASH || !env.EVIDENCE_REGISTRY_OWNER || !env.EVIDENCE_CONTENT_BASE_URL) {
+      errors.push("Pinned registry code hash/owner and EVIDENCE_CONTENT_BASE_URL are required in production");
+    }
+    if (env.AGENTKIT_IDEMPOTENCY_MODE !== "redis" || !env.AGENTKIT_REDIS_URL) {
+      errors.push("AGENTKIT_IDEMPOTENCY_MODE=redis and AGENTKIT_REDIS_URL are required in production");
+    }
+    if (!env.GOAT_ACTION_MANIFEST_SHA256) {
+      errors.push("GOAT_ACTION_MANIFEST_SHA256 is required to pin AgentKit tool metadata");
+    }
+    if (env.CLOUD_MODE === "true" && (!env.AZURE_MAA_TRUSTED_ISSUERS || !env.AZURE_MAA_AUDIENCE ||
+        !env.AZURE_MAA_TRUSTED_ROOT_FINGERPRINTS || !env.AZURE_MAA_ALLOWED_MEASUREMENTS)) {
+      errors.push("Verified Azure MAA mode requires pinned issuers, audience, root fingerprints, and measurements");
+    }
   }
 
   // 5. Fail fast if any errors
@@ -83,7 +108,7 @@ export function validateBootConfiguration(env: Record<string, string | undefined
     console.error("[Boot Validation FAILED]");
     errors.forEach((err) => console.error(`  ❌ ${err}`));
     if (isProduction) {
-      process.exit(1);
+      throw new Error(`Boot configuration rejected: ${errors.join("; ")}`);
     } else {
       console.warn("  ⚠️  Continuing in development mode despite errors");
     }

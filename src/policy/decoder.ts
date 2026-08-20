@@ -19,6 +19,10 @@ export interface AssetDefinition {
   native: boolean;
   /** Required for ERC-20 assets, must be null for native assets. */
   tokenAddress: string | null;
+  /** Unix seconds for the signed/operator-pinned price observation. */
+  priceUpdatedAt?: number;
+  priceSource?: string;
+  maxPriceAgeSeconds?: number;
 }
 
 type AssetRegistry = Map<number, Map<string, AssetDefinition>>;
@@ -30,6 +34,18 @@ function key(symbol: string): string {
 }
 
 export function registerAsset(chainId: number, def: AssetDefinition): void {
+  if (!Number.isFinite(def.priceUSD) || def.priceUSD <= 0 || def.priceUSD > 1_000_000_000) {
+    throw new Error(`[AssetRegistry] ${def.symbol} priceUSD must be finite and positive`);
+  }
+  const priceUpdatedAt = def.priceUpdatedAt ?? Math.floor(Date.now() / 1000);
+  const priceSource = def.priceSource || (process.env.NODE_ENV === "production" ? "" : "development-static");
+  const maxPriceAgeSeconds = def.maxPriceAgeSeconds ?? 300;
+  if (!Number.isSafeInteger(priceUpdatedAt) || priceUpdatedAt <= 0 || !priceSource) {
+    throw new Error(`[AssetRegistry] ${def.symbol} requires priceUpdatedAt and priceSource`);
+  }
+  if (!Number.isSafeInteger(maxPriceAgeSeconds) || maxPriceAgeSeconds < 1 || maxPriceAgeSeconds > 86_400) {
+    throw new Error(`[AssetRegistry] ${def.symbol} maxPriceAgeSeconds must be 1-86400`);
+  }
   if (!def.native && !def.tokenAddress) {
     throw new Error(`[AssetRegistry] ERC-20 asset ${def.symbol} requires a tokenAddress`);
   }
@@ -43,6 +59,9 @@ export function registerAsset(chainId: number, def: AssetDefinition): void {
     ...def,
     symbol: key(def.symbol),
     tokenAddress: def.tokenAddress ? ethers.getAddress(def.tokenAddress) : null,
+    priceUpdatedAt,
+    priceSource,
+    maxPriceAgeSeconds,
   });
 }
 
@@ -59,14 +78,32 @@ export function getAssetDefinition(chainId: number, symbol: string): AssetDefini
 function seedDefaultRegistry(): void {
   const GOAT_TESTNET3 = 48816;
   if (ASSET_REGISTRY.has(GOAT_TESTNET3)) return;
-  registerAsset(GOAT_TESTNET3, { symbol: "BTC", decimals: 18, priceUSD: 96500.0, native: true, tokenAddress: null });
-  registerAsset(GOAT_TESTNET3, { symbol: "GOAT", decimals: 18, priceUSD: 0.85, native: true, tokenAddress: null });
+  const isProduction = process.env.NODE_ENV === "production";
+  const price = (symbol: string, fallback: number) => {
+    const raw = process.env[`${symbol}_PRICE_USD`];
+    const timestamp = Number(process.env[`${symbol}_PRICE_UPDATED_AT`] || "0");
+    const source = process.env[`${symbol}_PRICE_SOURCE`];
+    if (isProduction && (!raw || !timestamp || !source)) return undefined;
+    return {
+      priceUSD: raw ? Number(raw) : fallback,
+      priceUpdatedAt: timestamp || Math.floor(Date.now() / 1000),
+      priceSource: source || "development-static",
+      maxPriceAgeSeconds: Number(process.env.PRICE_MAX_AGE_SECONDS || "300"),
+    };
+  };
+  const btc = price("BTC", 96500.0);
+  if (btc) registerAsset(GOAT_TESTNET3, { symbol: "BTC", decimals: 18, native: true, tokenAddress: null, ...btc });
 
   // ERC-20 stablecoins: register a contract address per deployment if configured.
   const usdc = process.env.USDC_TOKEN_ADDRESS;
   const usdt = process.env.USDT_TOKEN_ADDRESS;
-  if (usdc) registerAsset(GOAT_TESTNET3, { symbol: "USDC", decimals: 6, priceUSD: 1.0, native: false, tokenAddress: usdc });
-  if (usdt) registerAsset(GOAT_TESTNET3, { symbol: "USDT", decimals: 6, priceUSD: 1.0, native: false, tokenAddress: usdt });
+  const goat = process.env.GOAT_TOKEN_ADDRESS;
+  const usdcPrice = price("USDC", 1);
+  const usdtPrice = price("USDT", 1);
+  const goatPrice = price("GOAT", 0.85);
+  if (usdc && usdcPrice) registerAsset(GOAT_TESTNET3, { symbol: "USDC", decimals: 6, native: false, tokenAddress: usdc, ...usdcPrice });
+  if (usdt && usdtPrice) registerAsset(GOAT_TESTNET3, { symbol: "USDT", decimals: 6, native: false, tokenAddress: usdt, ...usdtPrice });
+  if (goat && goatPrice) registerAsset(GOAT_TESTNET3, { symbol: "GOAT", decimals: 18, native: false, tokenAddress: goat, ...goatPrice });
 }
 seedDefaultRegistry();
 
@@ -142,6 +179,12 @@ export class TransactionDecoder {
         `Register it with a trusted decimals/price (and contract address for ERC-20) before use.`
       );
     }
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const priceUpdatedAt = asset.priceUpdatedAt!;
+    if ((process.env.NODE_ENV === "production" || process.env.STRICT_PRICE_FRESHNESS === "true") &&
+        (priceUpdatedAt > nowSeconds + 30 || nowSeconds - priceUpdatedAt > asset.maxPriceAgeSeconds!)) {
+      throw new Error(`STALE_PRICE: ${symbol} price from ${asset.priceSource} is outside the freshness window`);
+    }
 
     // Initialise defensively so TypeScript (and the runtime) have a defined
     // value even if a future calldata branch is added without an amount.
@@ -197,12 +240,12 @@ export class TransactionDecoder {
       throw new Error("INVALID_AMOUNT: Transaction value is negative");
     }
 
-    const formattedAmount = Number(ethers.formatUnits(rawValueBigInt, asset.decimals));
-    if (isNaN(formattedAmount) || formattedAmount < 0) {
-      throw new Error("INVALID_AMOUNT: Transaction value is negative or NaN");
+    const priceUSDMicros = BigInt(Math.round(asset.priceUSD * 1_000_000));
+    const usdMicros = (rawValueBigInt * priceUSDMicros) / (10n ** BigInt(asset.decimals));
+    if (usdMicros > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new Error("INVALID_AMOUNT: USD valuation exceeds exact policy arithmetic range");
     }
-
-    const usdValue = formattedAmount * asset.priceUSD;
+    const usdValue = Number(usdMicros) / 1_000_000;
 
     // Deterministic content hash over the immutable identity (no timestamp), so
     // it doubles as a durable idempotency key.
@@ -231,6 +274,10 @@ export class TransactionDecoder {
       decimals: asset.decimals,
       priceUSD: asset.priceUSD,
       usdValue,
+      priceUSDMicros,
+      usdMicros,
+      priceUpdatedAt,
+      priceSource: asset.priceSource!,
       rawCalldata: params.data,
     }) as NormalizedAction;
   }
