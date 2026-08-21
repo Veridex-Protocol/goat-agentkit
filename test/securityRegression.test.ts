@@ -853,4 +853,17 @@ describe("VD-GOAT-015: No unsafe defaults in production", () => {
 
     errorSpy.mockRestore();
   });
+
+  it("boot validation binds the ERC-8004 agent namespace to GOAT_NETWORK", () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    expect(() => validateBootConfiguration({
+      NODE_ENV: "production",
+      GOAT_NETWORK: "goat-mainnet",
+      AGENT_ID: "erc8004:48816:1042",
+      EVIDENCE_REGISTRY_ADDRESS: "0x1111111111111111111111111111111111111111",
+    })).toThrow(/AGENT_ID chain must match goat-mainnet \(2345\)/);
+
+    errorSpy.mockRestore();
+  });
 });

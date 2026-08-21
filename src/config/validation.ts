@@ -29,6 +29,11 @@ export function validateBootConfiguration(env: Record<string, string | undefined
   if (isProduction && !/^erc8004:[1-9][0-9]*:(0|[1-9][0-9]*)$/.test(env.AGENT_ID || "")) {
     errors.push("AGENT_ID must explicitly identify a canonical erc8004:chainId:tokenId in production");
   }
+  const agentIdMatch = /^erc8004:([1-9][0-9]*):(0|[1-9][0-9]*)$/.exec(env.AGENT_ID || "");
+  const expectedChainId = goatNetwork === "goat-mainnet" ? 2345 : goatNetwork === "goat-testnet" ? 48816 : undefined;
+  if (agentIdMatch && expectedChainId !== undefined && Number(agentIdMatch[1]) !== expectedChainId) {
+    errors.push(`AGENT_ID chain must match ${goatNetwork} (${expectedChainId})`);
+  }
 
   // 1. Validate Evidence Registry address
   const defaultEvidenceRegistry = goatNetwork === "goat-mainnet"
