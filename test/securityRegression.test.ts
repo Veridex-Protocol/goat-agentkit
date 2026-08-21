@@ -154,6 +154,19 @@ describe("VRD-2026-001: normalized action semantic binding", () => {
 // ─── VD-GOAT-002: Mandate/Authorization Chain ────────────────────────────────
 
 describe("VD-GOAT-002: Mandate verification", () => {
+  it("refuses the integrity-only verifier for production trust decisions", () => {
+    const previous = process.env.NODE_ENV;
+    process.env.NODE_ENV = "production";
+    try {
+      expect(EvidenceBuilder.verifyBundle({} as any)).toEqual(expect.objectContaining({
+        valid: false,
+        reason: expect.stringContaining("verifyBundleWithMandate"),
+      }));
+    } finally {
+      process.env.NODE_ENV = previous;
+    }
+  });
+
   it("verifyBundleWithMandate should reject bundles that fail basic verification", async () => {
     // A tampered bundle should fail at the basic verification step
     const bundle = {
@@ -174,7 +187,7 @@ describe("VD-GOAT-002: Mandate verification", () => {
     expect(result.mandateVerified).toBe(false);
   });
 
-  it("verifyBundleWithMandate should require proper agentId prefix", async () => {
+  it("evidence signing should require a canonical ERC-8004 agentId", async () => {
     const signer = new LocalSessionSigner("0x" + "b".repeat(64));
     const signerAddr = await signer.getAddress();
     const traceData = { agentId: "not-erc8004-prefix", sessionKeyHash: ethers.id(signerAddr) };
@@ -189,15 +202,7 @@ describe("VD-GOAT-002: Mandate verification", () => {
       assembledAt: Date.now(),
     };
 
-    const signed = await signer.signBundle(bundle);
-
-    const result = await EvidenceBuilder.verifyBundleWithMandate(
-      signed,
-      {},
-      "0x1234567890123456789012345678901234567890"
-    );
-    expect(result.valid).toBe(false);
-    expect(result.mandateVerified).toBe(false);
+    await expect(signer.signBundle(bundle)).rejects.toThrow("Invalid or missing agentId format");
   });
 });
 

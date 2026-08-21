@@ -1,5 +1,5 @@
-import { Wallet, id, TypedDataDomain, TypedDataField, type Signer } from "ethers";
-import { EvidenceBundle } from "./builder.js";
+import { Wallet, id, TypedDataField, type Signer } from "ethers";
+import { EvidenceBundle, evidenceBundleDomain } from "./builder.js";
 
 export interface SessionSigner {
   getAddress(): Promise<string>;
@@ -17,7 +17,7 @@ export class EthersSessionSigner implements SessionSigner {
 
   public async signBundle(bundle: EvidenceBundle): Promise<EvidenceBundle> {
     const value = evidenceBundleValue(bundle);
-    bundle.signature = await this.signer.signTypedData(EVIDENCE_BUNDLE_DOMAIN, EVIDENCE_BUNDLE_TYPES, value);
+    bundle.signature = await this.signer.signTypedData(evidenceBundleDomain(bundle.trace?.agentId), EVIDENCE_BUNDLE_TYPES, value);
     return bundle;
   }
 
@@ -56,13 +56,6 @@ export const EVIDENCE_AUTHORIZATION_TYPES: Record<string, TypedDataField[]> = {
     { name: "storageUriHash", type: "bytes32" },
     { name: "deadline", type: "uint256" },
   ],
-};
-
-// EIP-712 domain for evidence bundle signatures (VD-GOAT-003 fix)
-const EVIDENCE_BUNDLE_DOMAIN: TypedDataDomain = {
-  name: "Veridex Evidence Bundle",
-  version: "1",
-  chainId: 48816, // GOAT Network Testnet3
 };
 
 const EVIDENCE_BUNDLE_TYPES: Record<string, TypedDataField[]> = {
@@ -116,7 +109,7 @@ export class LocalSessionSigner implements SessionSigner {
     const value = evidenceBundleValue(bundle);
 
     const signature = await this.wallet.signTypedData(
-      EVIDENCE_BUNDLE_DOMAIN,
+      evidenceBundleDomain(bundle.trace?.agentId),
       EVIDENCE_BUNDLE_TYPES,
       value
     );

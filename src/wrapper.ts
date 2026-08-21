@@ -375,10 +375,21 @@ export function wrapWalletAdapter(
               }
 
               // 4. Delegate Execution to Underlying Wallet Adapter
+              if (!config.transactionVerifier &&
+                  (process.env.NODE_ENV === "production" || process.env.STRICT_SETTLEMENT_VERIFICATION === "true")) {
+                throw new Error("[Veridex Wallet Adapter] An independent transactionVerifier is required before broadcasting");
+              }
+              if (!config.onTransactionUncertain && process.env.NODE_ENV === "production") {
+                throw new Error("[Veridex Wallet Adapter] A durable onTransactionUncertain reconciler is required before broadcasting");
+              }
               let result;
               if (typeof target[prop] === "function") {
-                result = await target[prop](...args);
+                // A generic wallet method may broadcast and then throw while
+                // waiting for an RPC response. Once control crosses this
+                // boundary, absence of a returned hash is not proof that no
+                // funds moved; retain the reservation for reconciliation.
                 operationMayHaveBroadcast = true;
+                result = await target[prop](...args);
               } else {
                 throw new Error(`Underlying wallet adapter function '${String(prop)}' is not invokable`);
               }
@@ -388,10 +399,6 @@ export function wrapWalletAdapter(
                 throw new Error("[Veridex Wallet Adapter] Underlying operation returned no transaction hash");
               }
               observedTxHash = txHash;
-              if (!config.transactionVerifier &&
-                  (process.env.NODE_ENV === "production" || process.env.STRICT_SETTLEMENT_VERIFICATION === "true")) {
-                throw new Error("[Veridex Wallet Adapter] An independent transactionVerifier is required before success evidence");
-              }
               if (config.transactionVerifier) {
                 const verified = await config.transactionVerifier({ txHash, action: boundAction!, result });
                 if (verified.status !== 1 || verified.txHash.toLowerCase() !== txHash.toLowerCase()) {

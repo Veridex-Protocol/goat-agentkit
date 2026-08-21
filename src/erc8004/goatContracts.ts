@@ -83,6 +83,7 @@ export async function verifyRegistryDeployment(
 }
 
 export const ERC8004_IDENTITY_ABI = [
+  "function ownerOf(uint256 agentId) external view returns (address)",
   "function register(string agentURI) external returns (uint256)",
   "function register(string agentURI, tuple(string metadataKey, bytes metadataValue)[] metadata) external returns (uint256)",
   "function setAgentURI(uint256 agentId, string calldata newURI) external",

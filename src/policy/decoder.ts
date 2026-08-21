@@ -148,6 +148,11 @@ export function assertNormalizedActionIntegrity(action: NormalizedAction): void 
     throw new Error("ACTION_BINDING_ERROR: normalized chain or value is invalid");
   }
   const symbol = key(action.symbol);
+  const operationPattern = /^(?:0x[a-fA-F0-9]{64}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12})$/;
+  if ((process.env.NODE_ENV === "production" && !action.operationId) ||
+      (action.operationId !== undefined && !operationPattern.test(action.operationId))) {
+    throw new Error("ACTION_BINDING_ERROR: production actions require a random UUID or bytes32 operationId");
+  }
   const asset = getAssetDefinition(action.chainId, symbol);
   if (!asset) throw new Error(`ACTION_BINDING_ERROR: ${symbol} is not registered on chain ${action.chainId}`);
   const from = ethers.getAddress(action.from);
@@ -191,6 +196,7 @@ export function assertNormalizedActionIntegrity(action: NormalizedAction): void 
     action.value.toString(),
     action.calldataSelector,
     symbol,
+    action.operationId || "content-only-development",
   ].join(":"));
   if (action.actionId.toLowerCase() !== expectedActionId.toLowerCase()) {
     throw new Error("ACTION_BINDING_ERROR: normalized action identifier is invalid");
@@ -247,11 +253,18 @@ export class TransactionDecoder {
     data?: string;
     asset?: string;
     chainId?: number;
+    /** Random UUID/bytes32 supplied by the durable request boundary. */
+    operationId?: string;
   }): NormalizedAction {
     const chainId = params.chainId || 48816;
     const fromAddr = ethers.getAddress(params.from);
     let toAddr = ethers.getAddress(params.to);
     let symbol = key(params.asset || "GOAT");
+    const operationPattern = /^(?:0x[a-fA-F0-9]{64}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12})$/;
+    if ((process.env.NODE_ENV === "production" && !params.operationId) ||
+        (params.operationId !== undefined && !operationPattern.test(params.operationId))) {
+      throw new Error("INVALID_OPERATION_ID: production actions require a random UUID or bytes32 operationId");
+    }
 
     // Resolve asset identity from the allowlist. Fail closed on unknown asset.
     const asset = getAssetDefinition(chainId, symbol);
@@ -329,8 +342,9 @@ export class TransactionDecoder {
     }
     const usdValue = Number(usdMicros) / 1_000_000;
 
-    // Deterministic content hash over the immutable identity (no timestamp), so
-    // it doubles as a durable idempotency key.
+    // Bind the caller's durable random operation identity to the exact transfer
+    // bytes. Retries reproduce this ID; two intentional identical transfers use
+    // distinct operation IDs.
     const actionId = ethers.id(
       [
         chainId,
@@ -340,11 +354,13 @@ export class TransactionDecoder {
         rawValueBigInt.toString(),
         calldataSelector,
         symbol,
+        params.operationId || "content-only-development",
       ].join(":")
     );
 
     return Object.freeze({
       actionId,
+      operationId: params.operationId,
       chainId,
       from: fromAddr,
       to: toAddr,

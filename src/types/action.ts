@@ -12,11 +12,13 @@ import { z } from "zod";
  *   recomputed from `usdValue`.
  * - `usdValue` is a trusted valuation derived from `value` + `decimals` + a
  *   registry price at decode time. It is advisory for policy only.
- * - `actionId` is a deterministic content hash over the immutable fields (no
- *   timestamp), suitable as a durable idempotency key.
+ * - `operationId` is a caller-generated random UUID/bytes32 bound into
+ *   `actionId`; production decoders require it so identical legitimate
+ *   transfers remain distinct while retries remain exactly-once.
  */
 export const NormalizedActionSchema = z.object({
   actionId: z.string(),
+  operationId: z.string().optional(),
   chainId: z.number().int().positive(),
   from: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
   to: z.string().regex(/^0x[a-fA-F0-9]{40}$/),

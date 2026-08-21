@@ -54,6 +54,16 @@ export function writeFileAtomic(
 
     // 3. Atomic rename (overwrites target on POSIX)
     fs.renameSync(tmpPath, filePath);
+
+    // 4. Persist the directory entry as well as the file contents. Without a
+    // directory fsync, a power loss can acknowledge the rename but lose it on
+    // disk, silently resurrecting older policy state after restart.
+    const dirFd = fs.openSync(targetDir, "r");
+    try {
+      fs.fsyncSync(dirFd);
+    } finally {
+      fs.closeSync(dirFd);
+    }
   } catch (error) {
     // Clean up temp file on error
     try {

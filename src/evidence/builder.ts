@@ -1,12 +1,36 @@
 import { keccak256, toUtf8Bytes, recoverAddress, getBytes, hashMessage, ethers, verifyTypedData, TypedDataDomain, TypedDataField } from "ethers";
 import { PolicyEvaluation, PaymentContext } from "../policy/rules.js";
 
-// EIP-712 domain for evidence bundle signatures (VD-GOAT-003 fix)
-const EVIDENCE_BUNDLE_DOMAIN: TypedDataDomain = {
-  name: "Veridex Evidence Bundle",
-  version: "1",
-  chainId: 48816,
-};
+export interface ERC8004AgentIdentity {
+  chainId: number;
+  tokenId: bigint;
+}
+
+/** Strict parser used by both evidence signing and on-chain verification. */
+export function parseERC8004AgentId(agentId: unknown): ERC8004AgentIdentity {
+  if (typeof agentId !== "string") {
+    throw new Error("Invalid or missing agentId format (expected erc8004:chainId:tokenId)");
+  }
+  const match = /^erc8004:([1-9][0-9]*):(0|[1-9][0-9]*)$/.exec(agentId);
+  if (!match) {
+    throw new Error("Invalid or missing agentId format (expected erc8004:chainId:tokenId)");
+  }
+  const chainId = Number(match[1]);
+  if (!Number.isSafeInteger(chainId) || chainId <= 0) {
+    throw new Error("ERC-8004 agentId chainId must be a positive safe integer");
+  }
+  return { chainId, tokenId: BigInt(match[2]) };
+}
+
+/** EIP-712 domain is derived from the canonical ERC-8004 agent namespace. */
+export function evidenceBundleDomain(agentId: unknown): TypedDataDomain {
+  const { chainId } = parseERC8004AgentId(agentId);
+  return {
+    name: "Veridex Evidence Bundle",
+    version: "1",
+    chainId,
+  };
+}
 
 const EVIDENCE_BUNDLE_TYPES: Record<string, TypedDataField[]> = {
   EvidenceBundle: [
@@ -262,6 +286,17 @@ export class EvidenceBuilder {
    * VD-GOAT-013 fix: Add input validation to prevent malformed/malicious bundles.
    */
   public static verifyBundle(bundle: EvidenceBundle): { valid: boolean; recoveredAddress?: string; reason?: string } {
+    if (process.env.NODE_ENV === "production" || process.env.STRICT_MANDATE === "true") {
+      return {
+        valid: false,
+        reason: "Production trust decisions require verifyBundleWithMandate(); verifyBundle() is integrity-only.",
+      };
+    }
+    return EvidenceBuilder.verifyBundleIntegrity(bundle);
+  }
+
+  /** Cryptographic integrity primitive used internally by mandate-aware trust verification. */
+  private static verifyBundleIntegrity(bundle: EvidenceBundle): { valid: boolean; recoveredAddress?: string; reason?: string } {
     // VD-GOAT-013 fix: Input validation
     if (!bundle || typeof bundle !== "object") {
       return { valid: false, reason: "Bundle must be an object" };
@@ -307,7 +342,7 @@ export class EvidenceBuilder {
       };
 
       const recoveredAddress = verifyTypedData(
-        EVIDENCE_BUNDLE_DOMAIN,
+        evidenceBundleDomain(bundle.trace?.agentId),
         EVIDENCE_BUNDLE_TYPES,
         value,
         bundle.signature
@@ -321,22 +356,6 @@ export class EvidenceBuilder {
         if (givenHash !== expectedHash && givenHash !== rawAddr) {
           return { valid: false, recoveredAddress, reason: "Signer address does not match trace sessionKeyHash" };
         }
-      }
-
-      // 3b. VD-GOAT-002 fix: Verify session is authorized (if mandate provided)
-      // Note: Full on-chain mandate verification requires:
-      // 1. Query Agent owner from ERC-8004 registry
-      // 2. Verify EIP-712 mandate signed by owner
-      // 3. Check expiry, nonce, revocation status
-      // This requires RPC provider and is async - implementers should:
-      // - Call verifyBundleWithMandate() for on-chain verification
-      // - Or verify mandate separately before trusting bundle
-      if (bundle.trace?.agentId && process.env.STRICT_MANDATE === "true") {
-        return {
-          valid: false,
-          recoveredAddress,
-          reason: "STRICT_MANDATE enabled but no mandate verification performed. Use verifyBundleWithMandate() for on-chain checks."
-        };
       }
 
       // 4. Verify bundleHash integrity if present
@@ -377,32 +396,95 @@ export class EvidenceBuilder {
   public static async verifyBundleWithMandate(
     bundle: EvidenceBundle,
     provider: any,
-    registryAddress: string
+    registryAddress: string,
+    identity: {
+      /** Official ERC-8004 Identity Registry for the agent namespace. */
+      identityRegistryAddress: string;
+      /** Optional additional pin for deployments that require a named owner. */
+      expectedAgentOwner?: string;
+    } | undefined = undefined,
   ): Promise<{ valid: boolean; recoveredAddress?: string; reason?: string; mandateVerified: boolean }> {
     // 1. First verify basic signature and integrity
-    const basicVerification = EvidenceBuilder.verifyBundle(bundle);
+    const basicVerification = EvidenceBuilder.verifyBundleIntegrity(bundle);
     if (!basicVerification.valid) {
       return { ...basicVerification, mandateVerified: false };
     }
 
     // 2. Parse agentId to get registry details
-    if (!bundle.trace?.agentId || !bundle.trace.agentId.startsWith("erc8004:")) {
+    let agentIdentity: ERC8004AgentIdentity;
+    try {
+      agentIdentity = parseERC8004AgentId(bundle.trace?.agentId);
+    } catch (error: any) {
       return {
         valid: false,
         recoveredAddress: basicVerification.recoveredAddress,
-        reason: "Invalid or missing agentId format (expected erc8004:chainId:tokenId)",
+        reason: error.message,
         mandateVerified: false,
       };
     }
 
     try {
+      if (!identity?.identityRegistryAddress || !ethers.isAddress(identity.identityRegistryAddress)) {
+        return {
+          valid: false,
+          recoveredAddress: basicVerification.recoveredAddress,
+          reason: "A pinned ERC-8004 identityRegistryAddress is required for mandate verification",
+          mandateVerified: false,
+        };
+      }
+      if (!ethers.isAddress(registryAddress)) {
+        return {
+          valid: false,
+          recoveredAddress: basicVerification.recoveredAddress,
+          reason: "A valid evidence registry address is required for mandate verification",
+          mandateVerified: false,
+        };
+      }
+      const network = await provider.getNetwork();
+      const connectedChainId = Number(network.chainId);
+      if (connectedChainId !== agentIdentity.chainId) {
+        return {
+          valid: false,
+          recoveredAddress: basicVerification.recoveredAddress,
+          reason: `ERC-8004 chain mismatch: agentId declares ${agentIdentity.chainId}, provider is connected to ${connectedChainId}`,
+          mandateVerified: false,
+        };
+      }
+
       // Query the immutable record created while the signer was authorized.
       // Looking only at the current allowlist would invalidate historical
       // evidence after a legitimate key rotation.
       const registryABI = [
+        "function owner() view returns (address)",
         "function getEvidenceRecord(bytes32) view returns (tuple(string agentId, bytes32 bundleHash, address sessionSigner, uint256 timestamp, address anchorer, string storageUri, bool exists))",
       ];
       const registry = new ethers.Contract(registryAddress, registryABI, provider);
+      const identityRegistry = new ethers.Contract(
+        identity.identityRegistryAddress,
+        ["function ownerOf(uint256 tokenId) view returns (address)"],
+        provider,
+      );
+      const [agentOwner, evidenceRegistryOwner] = await Promise.all([
+        identityRegistry.ownerOf(agentIdentity.tokenId),
+        registry.owner(),
+      ]);
+      if (ethers.getAddress(agentOwner) !== ethers.getAddress(evidenceRegistryOwner)) {
+        return {
+          valid: false,
+          recoveredAddress: basicVerification.recoveredAddress,
+          reason: "Evidence registry governance is not controlled by the current ERC-8004 identity token owner",
+          mandateVerified: false,
+        };
+      }
+      if (identity.expectedAgentOwner &&
+          ethers.getAddress(agentOwner) !== ethers.getAddress(identity.expectedAgentOwner)) {
+        return {
+          valid: false,
+          recoveredAddress: basicVerification.recoveredAddress,
+          reason: "ERC-8004 identity token owner does not match the pinned agent owner",
+          mandateVerified: false,
+        };
+      }
       const recoveredSigner = basicVerification.recoveredAddress;
       if (!recoveredSigner) {
         return {

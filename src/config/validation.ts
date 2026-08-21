@@ -16,6 +16,10 @@ export function validateBootConfiguration(env: Record<string, string | undefined
   const bytes32Pattern = /^(?:0x)?[a-fA-F0-9]{64}$/;
   const isPlaceholder = (value: string | undefined) => !value || /REPLACE_WITH|CHANGE_ME|PLACEHOLDER/i.test(value);
 
+  if (isProduction && !/^erc8004:[1-9][0-9]*:(0|[1-9][0-9]*)$/.test(env.AGENT_ID || "")) {
+    errors.push("AGENT_ID must explicitly identify a canonical erc8004:chainId:tokenId in production");
+  }
+
   // 1. Validate Evidence Registry address
   const registryAddr = env.EVIDENCE_REGISTRY_ADDRESS || (isProduction ? undefined : GOAT_ERC8004_ADDRESSES.testnet3.evidenceRegistry);
   if (!registryAddr || registryAddr === "0x0000000000000000000000000000000000000000") {
@@ -23,6 +27,10 @@ export function validateBootConfiguration(env: Record<string, string | undefined
   }
   if (isProduction && !addressPattern.test(registryAddr || "")) {
     errors.push("EVIDENCE_REGISTRY_ADDRESS must be an EVM address");
+  }
+  if (isProduction && (!addressPattern.test(env.IDENTITY_REGISTRY_ADDRESS || "") ||
+      !bytes32Pattern.test(env.IDENTITY_REGISTRY_CODE_HASH || ""))) {
+    errors.push("IDENTITY_REGISTRY_ADDRESS and IDENTITY_REGISTRY_CODE_HASH must pin the official ERC-8004 identity registry");
   }
 
   // 2. In production, session key is REQUIRED (no random wallet fallback)

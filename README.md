@@ -7,7 +7,7 @@ Security and evidence controls for GOAT Network AgentKit: exact transaction norm
 - A value-bearing operation must carry one immutable `NormalizedAction`. Caller-provided USD values, token labels, calldata semantics, or browser signatures are never authorization inputs.
 - Production policy reservations, spend accounting, replay nonces, and session revocation require transactional shared providers.
 - x402 success requires a complete merchant-signed, payer-bound V2 challenge, an exact EIP-712 payer authorization, and an RPC-verified mined transaction matching payer, chain, recipient/token contract, raw amount, calldata or native value, ERC-20 transfer log, and confirmation depth.
-- Direct wallet-wrapper success evidence requires an independent `transactionVerifier` in production.
+- Direct wallet-wrapper broadcasting requires an independent `transactionVerifier` and durable `onTransactionUncertain` reconciler in production.
 - EvidenceRegistry v3 separates evidence signers from gas-paying anchorers and binds the exact immutable storage URI in its EIP-712 authorization.
 - Exportable session/relayer keys, unverified TEE claims, stale prices, unsigned metadata, and silent state resets fail closed in production.
 
@@ -32,6 +32,7 @@ const action = TransactionDecoder.decodeAndNormalize({
   to: merchantAddress,
   asset: "USDC",
   rawValue: "20000000",
+  operationId: crypto.randomUUID(),
 });
 
 const evaluation = await policyGate.evaluate(action);
@@ -68,15 +69,16 @@ const secured = wrapX402PaymentActions(
     sessionAuthorizationVerifier,
     approvalVerifier,
     settlementNotifier,
+    uncertainSettlementHandler: persistForReconciliation,
   },
 );
 ```
 
-The wrapped spending action must broadcast the transaction derived from `_normalizedAction`. It must never recompute an amount from USD or return a synthetic hash.
+The wrapped spending action must broadcast the transaction derived from `_normalizedAction`. It must never recompute an amount from USD or return a synthetic hash. If an RPC error occurs after signed bytes may have been submitted, throw `X402BroadcastUncertainError`; the durable uncertainty handler and retained policy reservation then drive safe reconciliation.
 
 ## Evidence verification
 
-Use `EvidenceBuilder.verifyBundle()` for cryptographic integrity only. For production authorization use `EvidenceBuilder.verifyBundleWithMandate(bundle, provider, registryAddress)`, which requires an immutable v3 registry record binding the recovered signer, agent, bundle hash, and storage URI.
+Use `EvidenceBuilder.verifyBundle()` for cryptographic integrity only. For production authorization use `EvidenceBuilder.verifyBundleWithMandate(bundle, provider, registryAddress, { identityRegistryAddress, expectedAgentOwner })`. It requires an immutable v3 registry record binding the recovered signer, agent, bundle hash, and storage URI; matches the `agentId` chain to the connected provider; resolves the token through the official ERC-8004 Identity Registry; and requires the current identity-token owner to govern the evidence registry.
 
 ## Deployment
 
