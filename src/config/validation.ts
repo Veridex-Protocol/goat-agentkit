@@ -15,22 +15,38 @@ export function validateBootConfiguration(env: Record<string, string | undefined
   const addressPattern = /^0x[a-fA-F0-9]{40}$/;
   const bytes32Pattern = /^(?:0x)?[a-fA-F0-9]{64}$/;
   const isPlaceholder = (value: string | undefined) => !value || /REPLACE_WITH|CHANGE_ME|PLACEHOLDER/i.test(value);
+  const goatNetwork = env.GOAT_NETWORK || (isProduction ? undefined : "goat-testnet");
+  const canonicalIdentityRegistry = goatNetwork === "goat-mainnet"
+    ? GOAT_ERC8004_ADDRESSES.mainnet.identityRegistry
+    : goatNetwork === "goat-testnet"
+      ? GOAT_ERC8004_ADDRESSES.testnet3.identityRegistry
+      : undefined;
+
+  if (!canonicalIdentityRegistry) {
+    errors.push("GOAT_NETWORK must be explicitly set to goat-mainnet or goat-testnet");
+  }
 
   if (isProduction && !/^erc8004:[1-9][0-9]*:(0|[1-9][0-9]*)$/.test(env.AGENT_ID || "")) {
     errors.push("AGENT_ID must explicitly identify a canonical erc8004:chainId:tokenId in production");
   }
 
   // 1. Validate Evidence Registry address
-  const registryAddr = env.EVIDENCE_REGISTRY_ADDRESS || (isProduction ? undefined : GOAT_ERC8004_ADDRESSES.testnet3.evidenceRegistry);
+  const defaultEvidenceRegistry = goatNetwork === "goat-mainnet"
+    ? GOAT_ERC8004_ADDRESSES.mainnet.evidenceRegistry
+    : GOAT_ERC8004_ADDRESSES.testnet3.evidenceRegistry;
+  const registryAddr = env.EVIDENCE_REGISTRY_ADDRESS || (isProduction ? undefined : defaultEvidenceRegistry);
   if (!registryAddr || registryAddr === "0x0000000000000000000000000000000000000000") {
     errors.push("EVIDENCE_REGISTRY_ADDRESS must explicitly identify the reviewed registry");
   }
   if (isProduction && !addressPattern.test(registryAddr || "")) {
     errors.push("EVIDENCE_REGISTRY_ADDRESS must be an EVM address");
   }
-  if (isProduction && (!addressPattern.test(env.IDENTITY_REGISTRY_ADDRESS || "") ||
-      !bytes32Pattern.test(env.IDENTITY_REGISTRY_CODE_HASH || ""))) {
-    errors.push("IDENTITY_REGISTRY_ADDRESS and IDENTITY_REGISTRY_CODE_HASH must pin the official ERC-8004 identity registry");
+  if (env.IDENTITY_REGISTRY_ADDRESS && canonicalIdentityRegistry &&
+      env.IDENTITY_REGISTRY_ADDRESS.toLowerCase() !== canonicalIdentityRegistry.toLowerCase()) {
+    errors.push("IDENTITY_REGISTRY_ADDRESS must match AgentKit's canonical registry for GOAT_NETWORK");
+  }
+  if (isProduction && !bytes32Pattern.test(env.IDENTITY_REGISTRY_CODE_HASH || "")) {
+    errors.push("IDENTITY_REGISTRY_CODE_HASH must pin the runtime bytecode at AgentKit's canonical ERC-8004 identity registry");
   }
 
   // 2. In production, session key is REQUIRED (no random wallet fallback)
@@ -103,7 +119,7 @@ export function validateBootConfiguration(env: Record<string, string | undefined
     }
 
     // Mainnet evidence registry must be set
-    if (env.GOAT_NETWORK === "mainnet" && !GOAT_ERC8004_ADDRESSES.mainnet.evidenceRegistry) {
+    if (goatNetwork === "goat-mainnet" && !GOAT_ERC8004_ADDRESSES.mainnet.evidenceRegistry && !env.EVIDENCE_REGISTRY_ADDRESS) {
       errors.push("Mainnet evidence registry not configured");
     }
 

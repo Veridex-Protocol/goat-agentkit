@@ -32,6 +32,15 @@ export function evidenceBundleDomain(agentId: unknown): TypedDataDomain {
   };
 }
 
+function goatExplorerUrl(chainId: number, txHash: string): string {
+  const explorer = chainId === 2345
+    ? "https://explorer.goat.network"
+    : chainId === 48816
+      ? "https://explorer.testnet3.goat.network"
+      : undefined;
+  return explorer ? `${explorer}/tx/${txHash}` : `eip155:${chainId}:tx:${txHash}`;
+}
+
 const EVIDENCE_BUNDLE_TYPES: Record<string, TypedDataField[]> = {
   EvidenceBundle: [
     { name: "traceHash", type: "bytes32" },
@@ -267,7 +276,7 @@ export class EvidenceBuilder {
         txHash: params.settlementTxHash,
         traceHashInCalldata: false,
         chain: params.payload.chain || 48816,
-        explorerUrl: `https://explorer.testnet3.goat.network/tx/${params.settlementTxHash}`,
+        explorerUrl: goatExplorerUrl(params.payload.chain || 48816, params.settlementTxHash),
       },
       storageReceipt,
       assembledAt: timestamp,

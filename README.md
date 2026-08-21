@@ -80,6 +80,8 @@ The wrapped spending action must broadcast the transaction derived from `_normal
 
 Use `EvidenceBuilder.verifyBundle()` for cryptographic integrity only. For production authorization use `EvidenceBuilder.verifyBundleWithMandate(bundle, provider, registryAddress, { identityRegistryAddress, expectedAgentOwner })`. It requires an immutable v3 registry record binding the recovered signer, agent, bundle hash, and storage URI; matches the `agentId` chain to the connected provider; resolves the token through the official ERC-8004 Identity Registry; and requires the current identity-token owner to govern the evidence registry.
 
+Set `GOAT_NETWORK` to `goat-mainnet` or `goat-testnet`. The canonical ERC-8004 Identity Registry comes from the network mapping (`0x8004A169FB4a3325136EB29fA0ceB6D2e539a432` on mainnet, `0x556089008Fc0a60cD09390Eca93477ca254A5522` on Testnet3). An optional `IDENTITY_REGISTRY_ADDRESS` is accepted only when it exactly matches that canonical address; production still pins and verifies `IDENTITY_REGISTRY_CODE_HASH` before treating it as an authority.
+
 ## Deployment
 
 Deploy [`contracts/EvidenceRegistry.sol`](./contracts/EvidenceRegistry.sol), transfer ownership to reviewed governance with the two-step handoff, configure distinct evidence-signer and anchorer roles, and pin the runtime bytecode hash, owner, chain, and v3 domain at service startup.

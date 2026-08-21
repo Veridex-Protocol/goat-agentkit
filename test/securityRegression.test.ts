@@ -839,4 +839,18 @@ describe("VD-GOAT-015: No unsafe defaults in production", () => {
 
     errorSpy.mockRestore();
   });
+
+  it("boot validation rejects an ERC-8004 registry override outside the selected AgentKit network mapping", () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    expect(() => validateBootConfiguration({
+      NODE_ENV: "production",
+      GOAT_NETWORK: "goat-testnet",
+      AGENT_ID: "erc8004:48816:1042",
+      EVIDENCE_REGISTRY_ADDRESS: GOAT_ERC8004_ADDRESSES.testnet3.evidenceRegistry,
+      IDENTITY_REGISTRY_ADDRESS: GOAT_ERC8004_ADDRESSES.mainnet.identityRegistry,
+    })).toThrow(/must match AgentKit's canonical registry/);
+
+    errorSpy.mockRestore();
+  });
 });
